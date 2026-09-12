@@ -325,6 +325,10 @@ def analyze(root, contract):
     e20_15, e50_15 = ema(c15, 20), ema(c15, 50)
     e20_5, e50_5 = ema(c5, 20), ema(c5, 50)
 
+    h1_state = "UP" if e20h > e50h else "DOWN" if e20h < e50h else "FLAT"
+    m15_state = "UP" if e20_15 > e50_15 else "DOWN" if e20_15 < e50_15 else "FLAT"
+    m5_state = "UP" if e20_5 > e50_5 else "DOWN" if e20_5 < e50_5 else "FLAT"
+
     a = atr(m15) or price * 0.005
     rrsi = rsi(c15)
 
@@ -365,21 +369,40 @@ def analyze(root, contract):
             sl = max(resistance, price + a * 1.05)
             setup = "M15 retest in downtrend"
 
+    long_trigger = hi5
+    short_trigger = lo5
     base = {
         "symbol": contract["name"],
         "price": round(price, 6),
         "regime": regime,
+        "h1": h1_state,
+        "m15": m15_state,
+        "m5": m5_state,
+        "support": round(support, 6),
+        "resistance": round(resistance, 6),
+        "long_trigger": round(long_trigger, 6),
+        "short_trigger": round(short_trigger, 6),
+        "rsi": round(rrsi, 1),
+        "atr": round(a, 6),
         "liquidity": "OK" if vol_ok and q["oi"] > 0 else "CAUTION",
     }
 
     if not side:
+        reasons = []
+        if not (h1_state == m15_state == m5_state):
+            reasons.append(f"ТФ: H1 {h1_state} / M15 {m15_state} / M5 {m5_state}")
+        if h1_state == "UP" and price <= long_trigger:
+            reasons.append(f"LONG только после M5 > {round(long_trigger, 6)}")
+        if h1_state == "DOWN" and price >= short_trigger:
+            reasons.append(f"SHORT только после M5 < {round(short_trigger, 6)}")
+        if h1_state == "FLAT":
+            reasons.append("H1 без выраженного тренда")
+        if not reasons:
+            reasons.append("Нет качественного триггера; ждём подтверждение")
         base.update({
             "status": "WAIT",
             "rating": 5.0,
-            "reason": (
-                "Нет одновременного подтверждения H1/M15/M5; "
-                "ждём триггер."
-            ),
+            "reason": "; ".join(reasons[:2]),
         })
         return base
 
