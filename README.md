@@ -1,1 +1,1 @@
-# AA-analitik-bot
+# AA-analitik-bot\nMVP Telegram + MOEX analytics. Never commit the Telegram token.\n
