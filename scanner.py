@@ -111,7 +111,7 @@ def fetch_raw(secid, interval, days=2, max_rows=5000):
 
     # ISS commonly limits one response; paginate with start.
     while len(out) < max_rows:
-        u = f"{BASE}/engines/futures/markets/forts/securities/{secid}/candles"
+        u = f"{BASE}/engines/futures/markets/forts/securities/{secid}/candles.json"
         params = {
             "iss.meta": "off",
             "interval": interval,
