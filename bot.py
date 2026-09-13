@@ -11,8 +11,35 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 
 
 def send(chat, text):
-    r = requests.post(f"{API}/sendMessage", json={"chat_id": chat, "text": text, "parse_mode": "HTML"}, timeout=30)
-    r.raise_for_status()
+    # Telegram sendMessage has a ~4096 character limit.
+    # Split long reports into readable chunks so /scan does not fail with HTTP 400.
+    text = str(text or "")
+    limit = 3800
+    chunks = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        cut = text.rfind("\n\n", 0, limit)
+        if cut < 1200:
+            cut = text.rfind("\n", 0, limit)
+        if cut < 1200:
+            cut = limit
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+
+    for chunk in chunks or [""]:
+        r = requests.post(
+            f"{API}/sendMessage",
+            json={"chat_id": chat, "text": chunk, "parse_mode": "HTML"},
+            timeout=30,
+        )
+        if not r.ok:
+            try:
+                details = r.json()
+            except Exception:
+                details = r.text
+            raise RuntimeError(f"Telegram API {r.status_code}: {details}")
 
 
 def f(v, d=2):
