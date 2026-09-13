@@ -512,15 +512,12 @@ def analyze(x):
 
 
 def run_scan():
-    stocks = [
-        stage1(x)
-        for x in discover_stocks()
-    ]
-
-    futures = [
-        stage1(x)
-        for x in discover_futures()
-    ]
+    # Discovery endpoints already provide the liquidity ranking.
+    # Do NOT snapshot every security here: 400+ sequential ISS requests
+    # were making /scan take several minutes. Only the final candidates
+    # need detailed snapshots/candles in analyze().
+    stocks = discover_stocks()
+    futures = discover_futures()
 
     candidates = (
         stocks[:STAGE2]
