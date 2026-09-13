@@ -193,17 +193,42 @@ def aggregate_minutes(candles_1m, minutes):
 
 
 def candles(sec, kind, interval):
-    if interval == 60:
-        data = fetch_candles(sec, kind, 60, 14)
-        if len(data) >= 40:
-            return data
-        # Fallback to 1m if native H1 data is unavailable.
-        raw = fetch_candles(sec, kind, 1, 7)
-        return aggregate_minutes(raw, 60)
+    """Load enough history for analysis, including when the exchange is closed.
 
-    # M5/M15: fetch 1-minute data, then aggregate.
-    raw = fetch_candles(sec, kind, 1, 5)
-    return aggregate_minutes(raw, interval)
+    We deliberately retry with a deeper historical window instead of treating
+    a short recent sample as a reason to give up. This is important on
+    weekends/holidays and for contracts whose recent trading history is sparse.
+    """
+    if interval == 60:
+        best = []
+        for days in (14, 45, 120, 365):
+            data = fetch_candles(sec, kind, 60, days)
+            if len(data) > len(best):
+                best = data
+            if len(data) >= 60:
+                return data
+
+        # Final fallback: build H1 from minute history.
+        for days in (7, 30, 90, 365):
+            raw = fetch_candles(sec, kind, 1, days)
+            data = aggregate_minutes(raw, 60)
+            if len(data) > len(best):
+                best = data
+            if len(data) >= 60:
+                return data
+        return best
+
+    # M5/M15 are always built locally from M1. Use progressively deeper
+    # history so a closed market still has a meaningful last-session sample.
+    best = []
+    for days in (5, 20, 60, 180, 365):
+        raw = fetch_candles(sec, kind, 1, days)
+        data = aggregate_minutes(raw, interval)
+        if len(data) > len(best):
+            best = data
+        if len(data) >= 60:
+            return data
+    return best
 
 
 def snapshot(sec, kind):
@@ -501,6 +526,7 @@ def analyze(x):
             "h1": hs,
             "m15": ms,
             "m5": fs,
+            "data_asof": f[-1].get("begin") or m[-1].get("begin") or h[-1].get("begin"),
             "rsi": round(R, 1),
             "support": sup,
             "resistance": res,
@@ -549,6 +575,11 @@ def run_scan():
     with ThreadPoolExecutor(max_workers=8) as ex:
         result = list(ex.map(analyze, candidates))
 
+    all_result = result
+    asofs = [x.get("data_asof") for x in all_result if x.get("data_asof")]
+    weekend = datetime.now(timezone.utc).weekday() >= 5
+    market_mode = "HISTORICAL" if weekend else "LIVE_OR_LATEST"
+
     return {
         "longs": sorted(
             [x for x in result if x["status"] == "LONG"],
@@ -578,5 +609,8 @@ def run_scan():
             "stock_pool": STOCK_POOL,
             "futures_pool": FUTURES_POOL,
             "generated": datetime.now(timezone.utc).isoformat(),
+            "market_mode": market_mode,
+            "analysis_asof": max(asofs) if asofs else None,
+            "history_mode": True,
         },
     }

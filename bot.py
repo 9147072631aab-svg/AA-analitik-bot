@@ -117,9 +117,20 @@ def fmt(r):
         reverse=True,
     )[:6]
 
+    meta = r.get("meta", {})
+    mode = meta.get("market_mode")
+    asof = meta.get("analysis_asof")
+    if mode == "HISTORICAL":
+        market_line = "🔵 <b>РЫНОК ЗАКРЫТ — ИСТОРИЧЕСКИЙ РЕЖИМ</b>"
+        if asof:
+            market_line += f"\nПоследние доступные данные: {html.escape(str(asof))}"
+    else:
+        market_line = "🟢 <b>РЫНОК ОТКРЫТ / АКТУАЛЬНЫЕ ДАННЫЕ</b>"
+
     out = [
         "<b>📊 AA ANALITIK — MOEX</b>",
-        f"Universe: TQBR {r['meta']['stocks']} | FORTS {r['meta']['futures']}",
+        market_line,
+        f"Universe: TQBR {meta.get('stocks', 0)} | FORTS {meta.get('futures', 0)}",
         "",
         section("🏆 TOP LONG — АКЦИИ", stock_long),
         "",
@@ -145,6 +156,7 @@ def fmt(r):
         "TOP показывает лучшие анализируемые LONG/SHORT-кандидаты отдельно по акциям и фьючерсам. Технически неанализируемые инструменты в TOP не попадают.",
         "Вход — только после выполнения условий breakout + retest и остальных фильтров.",
         "",
+        "🔵 В историческом режиме анализ строится по последним доступным свечам; текущий вход не считается активным до открытия рынка.",
         "⚠️ Score — рейтинг, не вероятность. Новости пока не подключены. Бот не отправляет ордера.",
     ]
     return "\n\n".join(out)
