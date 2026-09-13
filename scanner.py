@@ -474,6 +474,9 @@ def analyze(x):
             **x,
             "status": status,
             "score": round(sc, 1),
+            "long_score": round(sl_score, 1),
+            "short_score": round(ss_score, 1),
+            "side": side,
             "price": price,
             "regime": (
                 "TREND UP" if hs == "UP"

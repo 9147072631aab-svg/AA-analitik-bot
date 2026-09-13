@@ -11,11 +11,7 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 
 
 def send(chat, text):
-    r = requests.post(
-        f"{API}/sendMessage",
-        json={"chat_id": chat, "text": text, "parse_mode": "HTML"},
-        timeout=30,
-    )
+    r = requests.post(f"{API}/sendMessage", json={"chat_id": chat, "text": text, "parse_mode": "HTML"}, timeout=30)
     r.raise_for_status()
 
 
@@ -26,52 +22,62 @@ def f(v, d=2):
         return "-"
 
 
-def card(x):
-    icon = "🟢" if x.get("status") == "LONG" else "🔴" if x.get("status") == "SHORT" else "🟡"
+def card(x, wait=True):
+    status = x.get("status", "WAIT")
+    icon = "🟢" if status == "LONG" else "🔴" if status == "SHORT" else "🟡"
     z = [
-        f"{icon} <b>{x.get('status')} — {html.escape(str(x.get('symbol')))}</b>",
+        f"{icon} <b>{html.escape(str(x.get('symbol')))} — {status}</b>",
         f"Score: <b>{f(x.get('score'), 1)}/100</b> | {x.get('regime', '-')}",
         f"Цена: <b>{f(x.get('price'))}</b> | H1 {x.get('h1', '-')} / M15 {x.get('m15', '-')} / M5 {x.get('m5', '-')}",
         f"RSI M15 {f(x.get('rsi'), 1)} | объём {f(x.get('volume_ratio'))}x",
     ]
-    if x.get("status") in ("LONG", "SHORT"):
+    if status in ("LONG", "SHORT"):
         z += [
             f"Вход <b>{f(x.get('entry'))}</b> | Trigger {f(x.get('trigger'))}",
             f"SL <b>{f(x.get('sl'))}</b> | TP1 {f(x.get('tp1'))} | TP2 {f(x.get('tp2'))} | TP3 {f(x.get('tp3'))}",
             f"R/R <b>{f(x.get('rr'))}</b>",
         ]
-    else:
+    elif wait:
         z.append("WAIT: " + html.escape(str(x.get("reason", "-")))[:350])
     return "\n".join(z)
 
 
+def candidate_card(x):
+    side = x.get("side", "LONG")
+    icon = "🟢" if side == "LONG" else "🔴"
+    return "\n".join([
+        f"{icon} <b>{html.escape(str(x.get('symbol')))} — {side}</b>",
+        f"Score: <b>{f(x.get('score'), 1)}/100</b> | статус: <b>{x.get('status', 'WAIT')}</b>",
+        f"Цена: <b>{f(x.get('price'))}</b> | H1 {x.get('h1', '-')} / M15 {x.get('m15', '-')} / M5 {x.get('m5', '-')}",
+        f"Причина: {html.escape(str(x.get('reason', '-')))[:350]}",
+    ])
+
+
 def fmt(r):
+    allc = r.get("stocks", []) + r.get("futures", [])
+    top_long = sorted([x for x in allc if x.get("side") == "LONG"], key=lambda x: float(x.get("score") or 0), reverse=True)[:3]
+    top_short = sorted([x for x in allc if x.get("side") == "SHORT"], key=lambda x: float(x.get("score") or 0), reverse=True)[:3]
+    confirmed = sorted([x for x in allc if x.get("status") in ("LONG", "SHORT")], key=lambda x: float(x.get("score") or 0), reverse=True)[:6]
+
     out = [
         "<b>📊 AA ANALITIK — MOEX</b>",
         f"Universe: TQBR {r['meta']['stocks']} | FORTS {r['meta']['futures']}",
+        "",
+        "<b>🏆 TOP LONG — ЛУЧШИЕ КАНДИДАТЫ</b>",
     ]
-    groups = [
-        ("🟢 TOP LONG — АКЦИИ", [x for x in r["longs"] if x["kind"] == "stock"]),
-        ("🔴 TOP SHORT — АКЦИИ", [x for x in r["shorts"] if x["kind"] == "stock"]),
-        ("🟢 TOP LONG — ФЬЮЧЕРСЫ", [x for x in r["longs"] if x["kind"] == "future"]),
-        ("🔴 TOP SHORT — ФЬЮЧЕРСЫ", [x for x in r["shorts"] if x["kind"] == "future"]),
-    ]
-    for title, arr in groups:
-        out += ["", f"<b>{title}</b>"] + ([card(x) for x in arr[:3]] or ["— нет подтверждённых входов"])
-    if not r["longs"] and not r["shorts"]:
-        out += ["", "<b>🟡 WAIT</b>"] + [
-            f"{html.escape(str(x.get('symbol')))} — {f(x.get('score'), 1)} — {html.escape(str(x.get('reason', '-')))}"
-            for x in r["watch"][:6]
-        ]
-    out += ["", "⚠️ Score — рейтинг, не вероятность. Новости этим сканером не проверяются. Бот не отправляет ордера."]
+    out += [candidate_card(x) for x in top_long] or ["— кандидатов нет"]
+    out += ["", "<b>🏆 TOP SHORT — ЛУЧШИЕ КАНДИДАТЫ</b>"]
+    out += [candidate_card(x) for x in top_short] or ["— кандидатов нет"]
+    out += ["", "<b>🔥 ПОДТВЕРЖДЁННЫЕ ВХОДЫ</b>"]
+    out += [card(x, wait=False) for x in confirmed] or ["Пока нет подтверждённого breakout + retest. Ждём триггер; в середине диапазона не входим."]
+    out += ["", "<b>ℹ️ TOP ≠ сигнал на вход</b>", "TOP показывает лучшие кандидаты. Вход — только после выполнения условий WAIT.", "", "⚠️ Score — рейтинг, не вероятность. Новости пока не подключены. Бот не отправляет ордера."]
     return "\n\n".join(out)
 
 
 def scan_in_background(chat):
     try:
         send(chat, "⏳ <b>Сканирование запущено.</b>\nПроверяю TQBR + FORTS, H1/M15/M5.\nРезультат пришлю автоматически.")
-        result = run_scan()
-        send(chat, fmt(result))
+        send(chat, fmt(run_scan()))
     except Exception as e:
         print("SCAN ERROR:", repr(e), flush=True)
         traceback.print_exc()
@@ -89,7 +95,7 @@ def handle(u):
         return
     try:
         if t in ("/start", "/help"):
-            send(chat, "<b>AA Analitik Bot</b>\n\n/scan — полный скан\n/stocks — акции\n/futures — фьючерсы\n/status — состояние\n\nБот НЕ отправляет ордера.")
+            send(chat, "<b>AA Analitik Bot</b>\n\n/scan — полный скан\n/stocks — акции\n/futures — фьючерсы\n/status — состояние\n\nTOP показывает лучшие LONG/SHORT кандидаты, даже если сейчас WAIT.\nБот НЕ отправляет ордера.")
             return
         if t == "/status":
             send(chat, "<b>AA Analitik</b>\nMOEX ISS • TQBR + FORTS • H1/M15/M5\nНовости: не подключены\nОрдера: НЕ отправляются.\nWebhook: работает.")
