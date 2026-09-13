@@ -297,7 +297,11 @@ def discover_futures():
             "step_price": n(x.get("STEPPRICE"), 0),
         })
 
-    return [max(v, key=lambda x: x["liq"]) for v in groups.values()]
+    return sorted(
+        [max(v, key=lambda x: x["liq"]) for v in groups.values()],
+        key=lambda x: x["liq"],
+        reverse=True,
+    )
 
 
 def stage1(x):
@@ -336,6 +340,7 @@ def analyze(x):
                 **x,
                 "status": "WAIT",
                 "score": 0,
+                "side": "WAIT",
                 "reason": (
                     f"Недостаточно свечей "
                     f"(H1={len(h)}, M15={len(m)}, M5={len(f)})"
@@ -510,6 +515,7 @@ def analyze(x):
             **x,
             "status": "WAIT",
             "score": 0,
+            "side": "WAIT",
             "reason": "Ошибка: " + str(e),
         }
 

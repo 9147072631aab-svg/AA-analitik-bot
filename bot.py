@@ -43,8 +43,8 @@ def card(x, wait=True):
 
 
 def candidate_card(x):
-    side = x.get("side", "LONG")
-    icon = "🟢" if side == "LONG" else "🔴"
+    side = x.get("side", "WAIT")
+    icon = "🟢" if side == "LONG" else "🔴" if side == "SHORT" else "🟡"
     return "\n".join([
         f"{icon} <b>{html.escape(str(x.get('symbol')))} — {side}</b>",
         f"Score: <b>{f(x.get('score'), 1)}/100</b> | статус: <b>{x.get('status', 'WAIT')}</b>",
@@ -53,24 +53,66 @@ def candidate_card(x):
     ])
 
 
+def top_by_side(items, side, limit=3):
+    return sorted(
+        [x for x in items if x.get("side") == side],
+        key=lambda x: float(x.get("score") or 0),
+        reverse=True,
+    )[:limit]
+
+
+def top_any(items, limit=3):
+    return sorted(items, key=lambda x: float(x.get("score") or 0), reverse=True)[:limit]
+
+
+def section(title, items):
+    out = [f"<b>{title}</b>"]
+    out += [candidate_card(x) for x in items] or ["— кандидатов нет"]
+    return "\n\n".join(out)
+
+
 def fmt(r):
-    allc = r.get("stocks", []) + r.get("futures", [])
-    top_long = sorted([x for x in allc if x.get("side") == "LONG"], key=lambda x: float(x.get("score") or 0), reverse=True)[:3]
-    top_short = sorted([x for x in allc if x.get("side") == "SHORT"], key=lambda x: float(x.get("score") or 0), reverse=True)[:3]
-    confirmed = sorted([x for x in allc if x.get("status") in ("LONG", "SHORT")], key=lambda x: float(x.get("score") or 0), reverse=True)[:6]
+    stocks = r.get("stocks", [])
+    futures = r.get("futures", [])
+    allc = stocks + futures
+
+    stock_long = top_by_side(stocks, "LONG")
+    stock_short = top_by_side(stocks, "SHORT")
+    future_long = top_by_side(futures, "LONG")
+    future_short = top_by_side(futures, "SHORT")
+
+    # Fallback for old scanner results without side: futures stay visible.
+    if not future_long and not future_short and futures:
+        future_long = top_any(futures, 3)
+
+    confirmed = sorted(
+        [x for x in allc if x.get("status") in ("LONG", "SHORT")],
+        key=lambda x: float(x.get("score") or 0),
+        reverse=True,
+    )[:6]
 
     out = [
         "<b>📊 AA ANALITIK — MOEX</b>",
         f"Universe: TQBR {r['meta']['stocks']} | FORTS {r['meta']['futures']}",
         "",
-        "<b>🏆 TOP LONG — ЛУЧШИЕ КАНДИДАТЫ</b>",
+        section("🏆 TOP LONG — АКЦИИ", stock_long),
+        "",
+        section("🏆 TOP SHORT — АКЦИИ", stock_short),
+        "",
+        section("🏆 TOP LONG — ФЬЮЧЕРСЫ", future_long),
+        "",
+        section("🏆 TOP SHORT — ФЬЮЧЕРСЫ", future_short),
+        "",
+        "<b>🔥 ПОДТВЕРЖДЁННЫЕ ВХОДЫ</b>",
     ]
-    out += [candidate_card(x) for x in top_long] or ["— кандидатов нет"]
-    out += ["", "<b>🏆 TOP SHORT — ЛУЧШИЕ КАНДИДАТЫ</b>"]
-    out += [candidate_card(x) for x in top_short] or ["— кандидатов нет"]
-    out += ["", "<b>🔥 ПОДТВЕРЖДЁННЫЕ ВХОДЫ</b>"]
     out += [card(x, wait=False) for x in confirmed] or ["Пока нет подтверждённого breakout + retest. Ждём триггер; в середине диапазона не входим."]
-    out += ["", "<b>ℹ️ TOP ≠ сигнал на вход</b>", "TOP показывает лучшие кандидаты. Вход — только после выполнения условий WAIT.", "", "⚠️ Score — рейтинг, не вероятность. Новости пока не подключены. Бот не отправляет ордера."]
+    out += [
+        "",
+        "<b>ℹ️ TOP ≠ сигнал на вход</b>",
+        "TOP показывает лучшие кандидаты отдельно по акциям и фьючерсам. Вход — только после выполнения условий WAIT.",
+        "",
+        "⚠️ Score — рейтинг, не вероятность. Новости пока не подключены. Бот не отправляет ордера.",
+    ]
     return "\n\n".join(out)
 
 
