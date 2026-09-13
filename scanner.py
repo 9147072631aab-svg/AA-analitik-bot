@@ -4,6 +4,7 @@ import re
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 BASE = "https://iss.moex.com/iss"
 TIMEOUT = int(os.getenv("MOEX_TIMEOUT", "20"))
@@ -17,6 +18,7 @@ FUTURES_POOL = int(os.getenv("FUTURES_POOL", "40"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "62"))
 WATCH_SCORE = float(os.getenv("WATCH_SCORE", "55"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.000001"))
+MSK = ZoneInfo("Europe/Moscow")
 
 s = requests.Session()
 s.headers.update({"User-Agent": "AA-Analitik/5.0"})
@@ -77,12 +79,15 @@ def atr(c, k=14):
 
 
 def parse_dt(v):
+    """Parse MOEX timestamps. ISS commonly returns candle times without an offset.
+    Those timestamps are Moscow exchange time, not UTC.
+    """
     if not v:
         return None
     try:
-        z = str(v).replace("Z", "+00:00")
+        z = str(v).strip().replace("Z", "+00:00")
         dt = datetime.fromisoformat(z)
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        return dt if dt.tzinfo else dt.replace(tzinfo=MSK)
     except Exception:
         return None
 
@@ -433,33 +438,46 @@ def analyze(x):
         vr = f[-1]["volume"] / avg if avg else 1
         R = rsi(M)
 
+        trigger_long = hi
+        trigger_short = lo
+
         def score(side):
-            v = 0
-
+            # Continuous 0..100 quality score. It deliberately rewards
+            # alignment and setup quality, not just a fixed set of booleans.
+            # Score is a ranking metric, never a probability.
             if side == "LONG":
-                v += 25 if hs == "UP" else -15 if hs == "DOWN" else 0
-                v += 15 if ms == "UP" else 0
-                v += 10 if fs == "UP" else 0
-                v += 10 if price > m20 else 0
-                v += 5 if R < 72 else -7 if R > 78 else 0
+                trend = (25 if hs == "UP" else 11 if hs == "FLAT" else 0)
+                mtrend = (15 if ms == "UP" else 7 if ms == "FLAT" else 0)
+                ftrend = (10 if fs == "UP" else 5 if fs == "FLAT" else 0)
+                price_ema = max(0.0, min(10.0, 5.0 + ((price - m20) / max(a, MIN_PRICE)) * 3.0))
+                rsi_part = max(0.0, min(8.0, 8.0 - abs(R - 55.0) * 0.18))
+                trig = trigger_long if side == "LONG" else trigger_short
+                trigger_dist = abs(trig - price) / max(a, MIN_PRICE)
+                trigger_part = max(0.0, 10.0 - min(trigger_dist, 2.0) * 5.0)
+                range_pos = (price - sup) / max(res - sup, MIN_PRICE)
+                range_part = max(0.0, min(10.0, 10.0 * (1.0 - abs(range_pos - 0.35) / 0.65)))
             else:
-                v += 25 if hs == "DOWN" else -15 if hs == "UP" else 0
-                v += 15 if ms == "DOWN" else 0
-                v += 10 if fs == "DOWN" else 0
-                v += 10 if price < m20 else 0
-                v += 5 if R > 28 else -7 if R < 22 else 0
+                trend = (25 if hs == "DOWN" else 11 if hs == "FLAT" else 0)
+                mtrend = (15 if ms == "DOWN" else 7 if ms == "FLAT" else 0)
+                ftrend = (10 if fs == "DOWN" else 5 if fs == "FLAT" else 0)
+                price_ema = max(0.0, min(10.0, 5.0 + ((m20 - price) / max(a, MIN_PRICE)) * 3.0))
+                rsi_part = max(0.0, min(8.0, 8.0 - abs(R - 45.0) * 0.18))
+                trig = trigger_long if side == "LONG" else trigger_short
+                trigger_dist = abs(price - trig) / max(a, MIN_PRICE)
+                trigger_part = max(0.0, 10.0 - min(trigger_dist, 2.0) * 5.0)
+                range_pos = (price - sup) / max(res - sup, MIN_PRICE)
+                range_part = max(0.0, min(10.0, 10.0 * (1.0 - abs(range_pos - 0.65) / 0.65)))
 
-            v += 7 if vr >= 1.15 else 0
-            v += 4 if x["kind"] == "future" and x.get("oi", 0) > 0 else 0
-
-            return max(0, min(100, v))
+            volume_part = max(0.0, min(7.0, 3.5 + (vr - 1.0) * 7.0))
+            oi_part = 5.0 if x["kind"] == "future" and x.get("oi", 0) > 0 else 0.0
+            return round(max(0.0, min(100.0, trend + mtrend + ftrend + price_ema + rsi_part + volume_part + oi_part + trigger_part + range_part)), 1)
 
         sl_score = score("LONG")
         ss_score = score("SHORT")
         side = "LONG" if sl_score >= ss_score else "SHORT"
         sc = max(sl_score, ss_score)
 
-        trigger = hi if side == "LONG" else lo
+        trigger = trigger_long if side == "LONG" else trigger_short
 
         crossed = (
             any(z["close"] > trigger for z in f[-10:-1])
@@ -495,7 +513,7 @@ def analyze(x):
         mid_low = sup + (res - sup) * 0.30
         mid_high = sup + (res - sup) * 0.70
 
-        if mid_low < price < mid_high:
+        if res > sup and mid_low < price < mid_high:
             hard.append("середина диапазона")
 
         entry = trigger
@@ -594,7 +612,7 @@ def run_scan():
     # The bot is primarily a research/reporting service. Outside the MOEX
     # trading window we label the report historical so the last candle is
     # never presented as a live quote. Moscow time is UTC+3 in this setup.
-    now_msk = datetime.now(timezone.utc) + timedelta(hours=3)
+    now_msk = datetime.now(timezone.utc).astimezone(MSK)
     weekday = now_msk.weekday()
     minutes = now_msk.hour * 60 + now_msk.minute
     market_open = (weekday < 5 and 10*60 <= minutes <= 23*60+50)

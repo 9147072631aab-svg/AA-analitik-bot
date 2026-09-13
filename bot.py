@@ -53,11 +53,13 @@ def asof_text(v):
         return "-"
     try:
         s = str(v).replace("Z", "+00:00")
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt = dt.astimezone(timezone(timedelta(hours=3)))
+            dt = dt.replace(tzinfo=ZoneInfo("Europe/Moscow"))
+        else:
+            dt = dt.astimezone(ZoneInfo("Europe/Moscow"))
         return dt.strftime("%d.%m.%Y %H:%M") + " MSK"
     except Exception:
         return str(v)
@@ -212,14 +214,20 @@ def fmt(r):
         "Пока нет подтверждённого breakout + retest. Ждём триггер; в середине диапазона не входим."
     ]
 
+    top_ids = {id(x) for x in (stock_long + stock_short + future_long + future_short)}
     watch = sorted(
-        [x for x in allc if x.get("status") == "WAIT" and x.get("watch")],
+        [
+            x for x in allc
+            if x.get("status") == "WAIT"
+            and x.get("watch")
+            and id(x) not in top_ids
+        ],
         key=lambda x: float(x.get("score") or 0),
         reverse=True,
     )[:6]
-    out += ["", "<b>🟡 НАБЛЮДЕНИЕ — ЖДЁМ ТРИГГЕР</b>"]
+    out += ["", "<b>🟡 ДОПОЛНИТЕЛЬНОЕ НАБЛЮДЕНИЕ — ЖДЁМ ТРИГГЕР</b>"]
     out += [candidate_card(x) for x in watch] or [
-        "Нет сильных кандидатов, требующих ожидания триггера."
+        "Все сильные кандидаты уже показаны в TOP."
     ]
 
     tech = technical_summary(allc)
