@@ -320,8 +320,6 @@ def analyze(root, contract):
     else:
         regime = "RANGE"
 
-    direction = 1 if regime == "TREND UP" else -1 if regime == "TREND DOWN" else 0
-
     e20_15, e50_15 = ema(c15, 20), ema(c15, 50)
     e20_5, e50_5 = ema(c5, 20), ema(c5, 50)
 
@@ -343,47 +341,62 @@ def analyze(root, contract):
     avgvol = sum(x["volume"] for x in m5[-21:-1]) / 20
     vol_ok = avgvol <= 0 or m5[-1]["volume"] >= avgvol * 1.15
 
-    # Strict entry confirmation: breakout -> completed M5 candle -> retest -> rejection.
-    # A level crossing alone is never an entry.
-    def confirmed_retest(side_name, level):
-        bars = m5[-10:]
+    # v3 logic:
+    # H1 = main direction, M15 = setup/pullback context, M5 = execution.
+    # M15 is deliberately allowed to be opposite H1 during a pullback.
+    # Entry still requires a fresh M5 breakout/breakdown, completed candle,
+    # retest and rejection. A mere level crossing is never an entry.
+    def confirmed_retest(side_name, level, lookback=12):
+        bars = m5[-lookback:]
         if len(bars) < 5:
             return False
         tol = max(a * 0.12, abs(level) * 0.0005)
-        for i in range(len(bars) - 2):
-            b = bars[i]
-            if side_name == "LONG":
-                if b["close"] <= level:
-                    continue
-                for r in bars[i + 1:]:
-                    if r["low"] <= level + tol and r["close"] > level:
-                        return True
-            else:
-                if b["close"] >= level:
-                    continue
-                for r in bars[i + 1:]:
-                    if r["high"] >= level - tol and r["close"] < level:
-                        return True
+        breakout_i = None
+        for i, b in enumerate(bars[:-1]):
+            if side_name == "LONG" and b["close"] > level:
+                breakout_i = i
+            elif side_name == "SHORT" and b["close"] < level:
+                breakout_i = i
+        if breakout_i is None:
+            return False
+        for r in bars[breakout_i + 1:]:
+            if side_name == "LONG" and r["low"] <= level + tol and r["close"] > level:
+                return True
+            if side_name == "SHORT" and r["high"] >= level - tol and r["close"] < level:
+                return True
         return False
 
     long_confirmed = confirmed_retest("LONG", hi5)
     short_confirmed = confirmed_retest("SHORT", lo5)
 
-    side = None
+    # M15 setup: price should be on the correct side of the broad structure.
+    # This permits a pullback against H1, but rejects entries in the middle of range.
+    long_m15_setup = (
+        h1_state == "UP"
+        and price > support + a * 0.15
+        and price < resistance + a * 0.35
+    )
+    short_m15_setup = (
+        h1_state == "DOWN"
+        and price < resistance - a * 0.15
+        and price > support - a * 0.35
+    )
 
-    if (h1_state == "UP" and m15_state == "UP" and m5_state == "UP"
-            and long_confirmed and vol_ok and rrsi < 72):
+    side = None
+    entry = sl = None
+    setup = None
+
+    if h1_state == "UP" and long_m15_setup and long_confirmed and vol_ok and rrsi < 72:
         side = "LONG"
         entry = price
         sl = min(support, price - a * 1.15)
-        setup = "M5 breakout + close + retest"
+        setup = "H1 uptrend + M15 pullback/setup + M5 breakout/retest"
 
-    elif (h1_state == "DOWN" and m15_state == "DOWN" and m5_state == "DOWN"
-          and short_confirmed and vol_ok and rrsi > 28):
+    elif h1_state == "DOWN" and short_m15_setup and short_confirmed and vol_ok and rrsi > 28:
         side = "SHORT"
         entry = price
         sl = max(resistance, price + a * 1.15)
-        setup = "M5 breakdown + close + retest"
+        setup = "H1 downtrend + M15 pullback/setup + M5 breakdown/retest"
 
     long_trigger = hi5
     short_trigger = lo5
@@ -405,50 +418,46 @@ def analyze(root, contract):
 
     if not side:
         reasons = []
-        if not (h1_state == m15_state == m5_state):
-            reasons.append(
-                f"ТФ не согласованы: H1 {h1_state} / M15 {m15_state} / M5 {m5_state}"
-            )
+        if h1_state == "FLAT":
+            reasons.append("H1 без направленного тренда")
         elif h1_state == "UP":
-            reasons.append(
-                f"LONG: нужен пробой {round(long_trigger, 6)}, закрытие M5 и ретест"
-            )
+            if not long_m15_setup:
+                reasons.append("LONG: цена не в рабочей зоне M15")
+            elif not long_confirmed:
+                reasons.append(f"LONG: нужен пробой {round(long_trigger, 6)}, закрытие M5 и ретест")
+            elif not vol_ok:
+                reasons.append("LONG: объём не подтверждает движение")
+            else:
+                reasons.append("LONG: ждём полного подтверждения")
         elif h1_state == "DOWN":
-            reasons.append(
-                f"SHORT: нужен пробой {round(short_trigger, 6)}, закрытие M5 и ретест"
-            )
-        else:
-            reasons.append("H1/M15/M5 без единого направления")
-        if not vol_ok:
+            if not short_m15_setup:
+                reasons.append("SHORT: цена не в рабочей зоне M15")
+            elif not short_confirmed:
+                reasons.append(f"SHORT: нужен пробой {round(short_trigger, 6)}, закрытие M5 и ретест")
+            elif not vol_ok:
+                reasons.append("SHORT: объём не подтверждает движение")
+            else:
+                reasons.append("SHORT: ждём полного подтверждения")
+
+        if not vol_ok and len(reasons) < 2:
             reasons.append("объём не подтверждает движение")
-        base.update({
-            "status": "WAIT",
-            "rating": 5.0,
-            "reason": "; ".join(reasons[:2]),
-        })
+
+        base.update({"status": "WAIT", "rating": 5.0, "reason": "; ".join(reasons[:2])})
         return base
 
     risk = abs(entry - sl)
     if risk <= 0:
-        return {
-            **base,
-            "status": "NO TRADE",
-            "rating": 0,
-            "reason": "Некорректный стоп.",
-        }
+        return {**base, "status": "NO TRADE", "rating": 0, "reason": "Некорректный стоп."}
 
-    f = (
-        (lambda k: entry + risk * k)
-        if side == "LONG"
-        else (lambda k: entry - risk * k)
-    )
+    f = (lambda k: entry + risk * k) if side == "LONG" else (lambda k: entry - risk * k)
 
     rating = min(
         10,
         round(
             7
             + (0.6 if vol_ok else 0)
-            + (0.5 if q["oi"] > 0 else 0),
+            + (0.5 if q["oi"] > 0 else 0)
+            + (0.4 if (m15_state == h1_state) else 0),
             1,
         ),
     )
@@ -462,10 +471,7 @@ def analyze(root, contract):
         tick_rub = q["step"] * q["lot"] * usd_rub
         per_contract = (risk / q["step"]) * tick_rub
         if per_contract > 0:
-            contracts = max(
-                0,
-                math.floor((capital * risk_pct / 100) / per_contract)
-            )
+            contracts = max(0, math.floor((capital * risk_pct / 100) / per_contract))
 
     trigger_level = hi5 if side == "LONG" else lo5
 
@@ -475,9 +481,8 @@ def analyze(root, contract):
         "setup": setup,
         "entry": round(entry, 6),
         "trigger": (
-            f"пробой + закрытие M5 "
-            f"{'выше' if side == 'LONG' else 'ниже'} "
-            f"{round(trigger_level, 6)} и ретест"
+            f"пробой + закрытие M5 {'выше' if side == 'LONG' else 'ниже'} "
+            f"{round(trigger_level, 6)} + ретест + отбой"
         ),
         "sl": round(sl, 6),
         "tp1": round(f(1.5), 6),
@@ -487,7 +492,6 @@ def analyze(root, contract):
         "risk_pct": risk_pct,
         "contracts": contracts,
     })
-
     return base
 
 
