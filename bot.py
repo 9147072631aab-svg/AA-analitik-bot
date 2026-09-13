@@ -21,6 +21,20 @@ def f(v, d=2):
     except Exception:
         return "-"
 
+def asof_text(v):
+    if not v:
+        return "-"
+    try:
+        s = str(v).replace("Z", "+00:00")
+        from datetime import datetime, timezone, timedelta
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone(timedelta(hours=3)))
+        return dt.strftime("%d.%m.%Y %H:%M") + " MSK"
+    except Exception:
+        return str(v)
+
 
 def card(x, wait=True):
     status = x.get("status", "WAIT")
@@ -44,13 +58,36 @@ def card(x, wait=True):
 
 def candidate_card(x):
     side = x.get("side", "WAIT")
-    icon = "🟢" if side == "LONG" else "🔴" if side == "SHORT" else "🟡"
-    return "\n".join([
-        f"{icon} <b>{html.escape(str(x.get('symbol')))} — {side}</b>",
-        f"Score: <b>{f(x.get('score'), 1)}/100</b> | статус: <b>{x.get('status', 'WAIT')}</b>",
+    status = x.get("status", "WAIT")
+    if status in ("LONG", "SHORT"):
+        label = f"{side} — ВХОД ГОТОВ"
+        icon = "🔥"
+    elif side in ("LONG", "SHORT") and x.get("watch"):
+        label = f"{side} — НАБЛЮДЕНИЕ"
+        icon = "🟡"
+    else:
+        label = "WAIT"
+        icon = "⚪"
+    lines = [
+        f"{icon} <b>{html.escape(str(x.get('symbol')))} — {label}</b>",
+        f"Score: <b>{f(x.get('score'), 1)}/100</b>",
         f"Цена: <b>{f(x.get('price'))}</b> | H1 {x.get('h1', '-')} / M15 {x.get('m15', '-')} / M5 {x.get('m5', '-')}",
-        f"Причина: {html.escape(str(x.get('reason', '-')))[:350]}",
-    ])
+    ]
+    if status in ("LONG", "SHORT"):
+        lines += [
+            f"Вход <b>{f(x.get('entry'))}</b> | Trigger {f(x.get('trigger'))}",
+            f"SL <b>{f(x.get('sl'))}</b> | TP1 {f(x.get('tp1'))} | TP2 {f(x.get('tp2'))} | TP3 {f(x.get('tp3'))}",
+            f"R/R <b>{f(x.get('rr'))}</b>",
+        ]
+    elif side in ("LONG", "SHORT") and x.get("watch"):
+        lines += [
+            f"Триггер: <b>{f(x.get('trigger'))}</b>",
+            f"Условие: {html.escape(str(x.get('trigger_condition', 'breakout + retest M5')))[:300]}",
+            f"Почему ждём: {html.escape(str(x.get('reason', '-')))[:300]}",
+        ]
+    else:
+        lines.append(f"Причина: {html.escape(str(x.get('reason', '-')))[:300]}")
+    return "\n".join(lines)
 
 
 def is_technical_wait(x):
@@ -68,7 +105,9 @@ def top_by_side(items, side, limit=3):
     # rows that could not be analysed because history/data was insufficient.
     pool = [
         x for x in items
-        if x.get("side") == side and not is_technical_wait(x)
+        if x.get("side") == side
+        and not is_technical_wait(x)
+        and (x.get("status") == side or x.get("watch"))
     ]
     return sorted(
         pool,
@@ -123,7 +162,7 @@ def fmt(r):
     if mode == "HISTORICAL":
         market_line = "🔵 <b>РЫНОК ЗАКРЫТ — ИСТОРИЧЕСКИЙ РЕЖИМ</b>"
         if asof:
-            market_line += f"\nПоследние доступные данные: {html.escape(str(asof))}"
+            market_line += f"\nПоследняя доступная сессия: <b>{html.escape(asof_text(asof))}</b>"
     else:
         market_line = "🟢 <b>РЫНОК ОТКРЫТ / АКТУАЛЬНЫЕ ДАННЫЕ</b>"
 
@@ -140,10 +179,20 @@ def fmt(r):
         "",
         section("🏆 TOP SHORT — ФЬЮЧЕРСЫ", future_short),
         "",
-        "<b>🔥 ПОДТВЕРЖДЁННЫЕ ВХОДЫ</b>",
+        "<b>🔥 ГОТОВЫЕ ВХОДЫ</b>",
     ]
     out += [card(x, wait=False) for x in confirmed] or [
         "Пока нет подтверждённого breakout + retest. Ждём триггер; в середине диапазона не входим."
+    ]
+
+    watch = sorted(
+        [x for x in allc if x.get("status") == "WAIT" and x.get("watch")],
+        key=lambda x: float(x.get("score") or 0),
+        reverse=True,
+    )[:6]
+    out += ["", "<b>🟡 НАБЛЮДЕНИЕ — ЖДЁМ ТРИГГЕР</b>"]
+    out += [candidate_card(x) for x in watch] or [
+        "Нет сильных кандидатов, требующих ожидания триггера."
     ]
 
     tech = technical_summary(allc)
@@ -156,7 +205,7 @@ def fmt(r):
         "TOP показывает лучшие анализируемые LONG/SHORT-кандидаты отдельно по акциям и фьючерсам. Технически неанализируемые инструменты в TOP не попадают.",
         "Вход — только после выполнения условий breakout + retest и остальных фильтров.",
         "",
-        "🔵 В историческом режиме анализ строится по последним доступным свечам; текущий вход не считается активным до открытия рынка.",
+        "🔵 В историческом режиме анализ строится по последней доступной торговой сессии; цена из последней свечи, а не текущая котировка. Вход не считается активным до открытия рынка.",
         "⚠️ Score — рейтинг, не вероятность. Новости пока не подключены. Бот не отправляет ордера.",
     ]
     return "\n\n".join(out)

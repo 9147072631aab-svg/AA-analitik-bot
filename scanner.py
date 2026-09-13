@@ -15,6 +15,8 @@ STAGE2 = int(os.getenv("STAGE2", "8"))
 STOCK_POOL = int(os.getenv("STOCK_POOL", "16"))
 FUTURES_POOL = int(os.getenv("FUTURES_POOL", "40"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "62"))
+WATCH_SCORE = float(os.getenv("WATCH_SCORE", "55"))
+MIN_PRICE = float(os.getenv("MIN_PRICE", "0.000001"))
 
 s = requests.Session()
 s.headers.update({"User-Agent": "AA-Analitik/5.0"})
@@ -376,6 +378,7 @@ def analyze(x):
                 "status": "WAIT",
                 "score": 0,
                 "side": "WAIT",
+                "watch": False,
                 "reason": (
                     f"Недостаточно свечей "
                     f"(H1={len(h)}, M15={len(m)}, M5={len(f)})"
@@ -383,7 +386,13 @@ def analyze(x):
             }
 
         q = snapshot(x["secid"], x["kind"])
-        price = n(q.get("LAST"), f[-1]["close"])
+        last_quote = n(q.get("LAST"), 0)
+        price = last_quote if last_quote > MIN_PRICE else f[-1]["close"]
+        if price <= MIN_PRICE:
+            return {
+                **x, "status": "WAIT", "score": 0, "side": "WAIT",
+                "reason": "Невалидная цена: нет актуальной котировки и закрытия свечи",
+            }
 
         H = [z["close"] for z in h]
         M = [z["close"] for z in m]
@@ -504,11 +513,10 @@ def analyze(x):
             t2 = entry - risk * 2.2
             t3 = entry - risk * 3
 
-        status = (
-            side
-            if sc >= MIN_SCORE and not hard
-            else "WAIT"
-        )
+        if sc >= MIN_SCORE and not hard:
+            status = side
+        else:
+            status = "WAIT"
 
         return {
             **x,
@@ -539,6 +547,11 @@ def analyze(x):
             "rr": 3,
             "volume_ratio": round(vr, 2),
             "liquidity": "OK" if x.get("liq", 0) > 10 else "CAUTION",
+            "watch": sc >= WATCH_SCORE and bool(hard),
+            "trigger_condition": (
+                f"LONG: пробой и ретест {trigger:.6g}" if side == "LONG"
+                else f"SHORT: пробой и ретест {trigger:.6g}"
+            ),
             "reason": (
                 "; ".join(hard)
                 if hard
@@ -552,6 +565,7 @@ def analyze(x):
             "status": "WAIT",
             "score": 0,
             "side": "WAIT",
+            "watch": False,
             "reason": "Ошибка: " + str(e),
         }
 
@@ -577,8 +591,14 @@ def run_scan():
 
     all_result = result
     asofs = [x.get("data_asof") for x in all_result if x.get("data_asof")]
-    weekend = datetime.now(timezone.utc).weekday() >= 5
-    market_mode = "HISTORICAL" if weekend else "LIVE_OR_LATEST"
+    # The bot is primarily a research/reporting service. Outside the MOEX
+    # trading window we label the report historical so the last candle is
+    # never presented as a live quote. Moscow time is UTC+3 in this setup.
+    now_msk = datetime.now(timezone.utc) + timedelta(hours=3)
+    weekday = now_msk.weekday()
+    minutes = now_msk.hour * 60 + now_msk.minute
+    market_open = (weekday < 5 and 10*60 <= minutes <= 23*60+50)
+    market_mode = "LIVE_OR_LATEST" if market_open else "HISTORICAL"
 
     return {
         "longs": sorted(
