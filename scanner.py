@@ -2,6 +2,8 @@ import os
 import math
 import re
 import threading
+import time
+import logging
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
@@ -9,18 +11,20 @@ from zoneinfo import ZoneInfo
 
 BASE = "https://iss.moex.com/iss"
 TIMEOUT = int(os.getenv("MOEX_TIMEOUT", "15"))
-MAX_WORKERS = int(os.getenv("SCAN_WORKERS", "12"))
-STOCK_POOL = int(os.getenv("STOCK_POOL", "12"))
-FUTURES_POOL = int(os.getenv("FUTURES_POOL", "24"))
+MAX_WORKERS = int(os.getenv("SCAN_WORKERS", "6"))
+STOCK_POOL = int(os.getenv("STOCK_POOL", "8"))
+FUTURES_POOL = int(os.getenv("FUTURES_POOL", "16"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "62"))
 WATCH_SCORE = float(os.getenv("WATCH_SCORE", "60"))
 MAX_TRIGGER_ATR = float(os.getenv("MAX_TRIGGER_ATR", "1.50"))
 MAX_WATCH_TRIGGER_ATR = float(os.getenv("MAX_WATCH_TRIGGER_ATR", "1.75"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.000001"))
-H1_DAYS = int(os.getenv("H1_DAYS", "14"))
-M1_DAYS = int(os.getenv("M1_DAYS", "3"))
+H1_DAYS = int(os.getenv("H1_DAYS", "10"))
+M1_DAYS = int(os.getenv("M1_DAYS", "1"))
 MSK = ZoneInfo("Europe/Moscow")
 _thread_local = threading.local()
+log = logging.getLogger("aa_scanner")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
 def session():
@@ -45,9 +49,17 @@ def n(x, d=0.0):
 
 
 def get(url, p):
-    r = session().get(url, params=p, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+    last = None
+    for attempt in range(3):
+        try:
+            r = session().get(url, params=p, timeout=TIMEOUT)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            if attempt < 2:
+                time.sleep(0.4 * (attempt + 1))
+    raise last
 
 
 def ema(a, k):
@@ -244,26 +256,21 @@ def discover_futures():
 
 
 def analyze(x):
+    started = time.monotonic()
     try:
+        log.info("ANALYZE START %s %s", x.get("kind"), x.get("symbol"))
         h, m, f = load_timeframes(x["secid"], x["kind"])
         if min(len(h), len(m), len(f)) < 40:
             return {**x, "status": "WAIT", "score": 0, "side": "WAIT", "watch": False,
                     "reason": f"Недостаточно свечей (H1={len(h)}, M15={len(m)}, M5={len(f)})"}
 
-        q = snapshot(x["secid"], x["kind"])
-        last_quote = n(q.get("LAST"), 0)
-        price = last_quote if last_quote > MIN_PRICE else f[-1]["close"]
+        # Render-friendly: avoid an extra ISS snapshot request per instrument.
+        # Discovery already supplies liquidity/contract metadata; price comes from the
+        # latest available M5 candle, which is also correct in historical mode.
+        price = f[-1]["close"]
         if price <= MIN_PRICE:
             return {**x, "status": "WAIT", "score": 0, "side": "WAIT", "watch": False,
-                    "reason": "Невалидная цена: нет котировки и закрытия свечи"}
-
-        # Refresh contract metadata once, but never let a zero LAST erase the candle price.
-        x = {**x,
-             "oi": n(q.get("OPENPOSITION"), x.get("oi", 0)),
-             "volume": n(q.get("VOLUME"), x.get("volume", 0)),
-             "step": n(q.get("MINSTEP"), x.get("step", 0.01)),
-             "step_price": n(q.get("STEPPRICE"), x.get("step_price", 0)),
-             "lot": max(1, n(q.get("LOTSIZE"), x.get("lot", 1)))}
+                    "reason": "Невалидная цена последней M5 свечи"}
 
         H, M, F = [z["close"] for z in h], [z["close"] for z in m], [z["close"] for z in f]
         h20, h50, m20, m50, f20, f50 = ema(H,20), ema(H,50), ema(M,20), ema(M,50), ema(F,20), ema(F,50)
@@ -396,14 +403,25 @@ def analyze(x):
             "reason": "; ".join(hard) if hard else "подтверждённый сетап",
         }
     except Exception as e:
+        log.exception("ANALYZE ERROR %s", x.get("symbol"))
         return {**x, "status":"WAIT", "score":0, "side":"WAIT", "watch":False, "reason":"Ошибка: "+str(e)}
 
 
 def run_scan():
-    stocks = discover_stocks(); futures = discover_futures()
+    scan_started = time.monotonic()
+    log.info("SCAN START")
+    stocks = discover_stocks()
+    futures = discover_futures()
     candidates = stocks[:STOCK_POOL] + futures[:FUTURES_POOL]
+    log.info("SCAN UNIVERSE TQBR=%d FORTS=%d | ANALYZE=%d", len(stocks), len(futures), len(candidates))
+
+    result = []
+    # Small bounded batches keep Render Free responsive and avoid CPU/network bursts.
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        result = list(ex.map(analyze, candidates))
+        for i, item in enumerate(ex.map(analyze, candidates), 1):
+            result.append(item)
+            if i % 4 == 0 or i == len(candidates):
+                log.info("SCAN PROGRESS %d/%d elapsed=%.1fs", i, len(candidates), time.monotonic()-scan_started)
 
     asofs = [parse_dt(x.get("data_asof")) for x in result if x.get("data_asof")]
     asofs = [x for x in asofs if x]
@@ -412,24 +430,22 @@ def run_scan():
     market_open = weekday < 5 and 10*60 <= minutes <= 23*60+50
     market_mode = "LIVE_OR_LATEST" if market_open else "HISTORICAL"
 
-    def side_sorted(side, kind=None, statuses=("LONG","SHORT")):
-        return sorted([x for x in result if x.get("status") == side and (kind is None or x.get("kind") == kind)], key=lambda x:x.get("score",0), reverse=True)
-
     longs = sorted([x for x in result if x.get("status")=="LONG"], key=lambda x:x.get("score",0), reverse=True)
     shorts = sorted([x for x in result if x.get("status")=="SHORT"], key=lambda x:x.get("score",0), reverse=True)
     watch = sorted([x for x in result if x.get("status")=="WAIT" and x.get("watch")], key=lambda x:x.get("score",0), reverse=True)
     errors = [{"symbol":x.get("symbol","-"),"reason":x.get("reason","-")} for x in result if str(x.get("reason","")).lower().startswith("ошибка")]
     skipped = [{"symbol":x.get("symbol","-"),"reason":x.get("reason","-")} for x in result if "недостаточно свечей" in str(x.get("reason","")).lower()]
 
+    log.info("SCAN DONE %.1fs results=%d errors=%d", time.monotonic()-scan_started, len(result), len(errors))
     return {
         "longs": longs, "shorts": shorts, "watch": watch,
         "stocks": [x for x in result if x.get("kind")=="stock"],
         "futures": [x for x in result if x.get("kind")=="future"],
         "meta": {
-            "stocks":len(stocks), "futures":len(futures), "stock_pool":STOCK_POOL, "futures_pool":FUTURES_POOL,
-            "workers":MAX_WORKERS, "m1_days":M1_DAYS, "h1_days":H1_DAYS,
-            "generated":datetime.now(timezone.utc).isoformat(), "market_mode":market_mode,
-            "analysis_asof":max(asofs).isoformat() if asofs else None, "history_mode":True, "scanner_version":"2.0",
-            "analysis_errors":errors, "technical_skipped":skipped,
+            "stocks":len(stocks), "futures":len(futures), "stock_analyzed":STOCK_POOL,
+            "futures_analyzed":FUTURES_POOL, "analyzed":len(result),
+            "asof": max(asofs).isoformat() if asofs else None,
+            "mode":market_mode, "errors":errors, "skipped":skipped,
+            "duration_sec": round(time.monotonic()-scan_started, 1),
         }
     }

@@ -126,17 +126,18 @@ def fmt(r):
     confirmed = sorted([x for x in allc if x.get("status") in ("LONG", "SHORT")], key=lambda x: float(x.get("score") or 0), reverse=True)[:4]
 
     meta = r.get("meta", {})
-    if meta.get("market_mode") == "HISTORICAL":
+    if meta.get("mode") == "HISTORICAL":
         market_line = "🔵 <b>РЫНОК ЗАКРЫТ — ИСТОРИЧЕСКИЙ РЕЖИМ</b>"
-        if meta.get("analysis_asof"):
-            market_line += f"\nПоследняя доступная сессия: <b>{html.escape(asof_text(meta['analysis_asof']))}</b>"
+        if meta.get("asof"):
+            market_line += f"\nПоследняя доступная сессия: <b>{html.escape(asof_text(meta['asof']))}</b>"
     else:
         market_line = "🟢 <b>РЫНОК ОТКРЫТ / АКТУАЛЬНЫЕ ДАННЫЕ</b>"
 
     out = [
-        "<b>📊 AA ANALITIK — MOEX v2.0</b>",
+        "<b>📊 AA ANALITIK — MOEX v2.1</b>",
         market_line,
-        f"Universe: TQBR {meta.get('stocks', 0)} | FORTS {meta.get('futures', 0)} | Quality gate: ON",
+        f"Universe: TQBR {meta.get('stocks', 0)} | FORTS {meta.get('futures', 0)} | "
+        f"анализ: {meta.get('analyzed', 0)} | {meta.get('duration_sec', '-')} сек. | Quality gate: ON",
         "",
         "<b>🏆 TOP LONG — АКЦИИ</b>",
         *([candidate_card(x, compact=True) for x in sl] or ["— нет качественных кандидатов"]),
@@ -180,7 +181,7 @@ def scan_in_background(chat):
         send(chat, "🟡 <b>Сканирование уже выполняется.</b> Дождись текущего результата.")
         return
     try:
-        send(chat, "⏳ <b>Сканирование запущено.</b>\nTQBR + FORTS • H1/M15/M5\nИспользую быстрый режим: один общий поток M1 на инструмент.")
+        send(chat, "⏳ <b>Сканирование запущено.</b>\nTQBR + FORTS • H1/M15/M5\nRender-safe режим: ограниченная параллельность + общий M1 на инструмент.")
         send(chat, fmt(run_scan()))
     except Exception as e:
         print("SCAN ERROR:", repr(e), flush=True)
