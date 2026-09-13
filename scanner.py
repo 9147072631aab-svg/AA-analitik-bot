@@ -16,7 +16,9 @@ STAGE2 = int(os.getenv("STAGE2", "8"))
 STOCK_POOL = int(os.getenv("STOCK_POOL", "16"))
 FUTURES_POOL = int(os.getenv("FUTURES_POOL", "40"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "62"))
-WATCH_SCORE = float(os.getenv("WATCH_SCORE", "55"))
+WATCH_SCORE = float(os.getenv("WATCH_SCORE", "60"))
+MAX_TRIGGER_ATR = float(os.getenv("MAX_TRIGGER_ATR", "1.50"))
+MAX_WATCH_TRIGGER_ATR = float(os.getenv("MAX_WATCH_TRIGGER_ATR", "1.75"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.000001"))
 MSK = ZoneInfo("Europe/Moscow")
 
@@ -442,27 +444,27 @@ def analyze(x):
         trigger_short = lo
 
         def score(side):
-            # Continuous 0..100 quality score. It deliberately rewards
-            # alignment and setup quality, not just a fixed set of booleans.
-            # Score is a ranking metric, never a probability.
+            # Continuous quality score 0..100. This is a ranking metric, not
+            # a probability. Setup-specific penalties are applied below so a
+            # strong trend cannot hide a poor/overextended entry location.
             if side == "LONG":
-                trend = (25 if hs == "UP" else 11 if hs == "FLAT" else 0)
-                mtrend = (15 if ms == "UP" else 7 if ms == "FLAT" else 0)
-                ftrend = (10 if fs == "UP" else 5 if fs == "FLAT" else 0)
+                trend = 25 if hs == "UP" else 11 if hs == "FLAT" else 0
+                mtrend = 15 if ms == "UP" else 7 if ms == "FLAT" else 0
+                ftrend = 10 if fs == "UP" else 5 if fs == "FLAT" else 0
                 price_ema = max(0.0, min(10.0, 5.0 + ((price - m20) / max(a, MIN_PRICE)) * 3.0))
                 rsi_part = max(0.0, min(8.0, 8.0 - abs(R - 55.0) * 0.18))
-                trig = trigger_long if side == "LONG" else trigger_short
+                trig = trigger_long
                 trigger_dist = abs(trig - price) / max(a, MIN_PRICE)
                 trigger_part = max(0.0, 10.0 - min(trigger_dist, 2.0) * 5.0)
                 range_pos = (price - sup) / max(res - sup, MIN_PRICE)
                 range_part = max(0.0, min(10.0, 10.0 * (1.0 - abs(range_pos - 0.35) / 0.65)))
             else:
-                trend = (25 if hs == "DOWN" else 11 if hs == "FLAT" else 0)
-                mtrend = (15 if ms == "DOWN" else 7 if ms == "FLAT" else 0)
-                ftrend = (10 if fs == "DOWN" else 5 if fs == "FLAT" else 0)
+                trend = 25 if hs == "DOWN" else 11 if hs == "FLAT" else 0
+                mtrend = 15 if ms == "DOWN" else 7 if ms == "FLAT" else 0
+                ftrend = 10 if fs == "DOWN" else 5 if fs == "FLAT" else 0
                 price_ema = max(0.0, min(10.0, 5.0 + ((m20 - price) / max(a, MIN_PRICE)) * 3.0))
                 rsi_part = max(0.0, min(8.0, 8.0 - abs(R - 45.0) * 0.18))
-                trig = trigger_long if side == "LONG" else trigger_short
+                trig = trigger_short
                 trigger_dist = abs(price - trig) / max(a, MIN_PRICE)
                 trigger_part = max(0.0, 10.0 - min(trigger_dist, 2.0) * 5.0)
                 range_pos = (price - sup) / max(res - sup, MIN_PRICE)
@@ -470,14 +472,17 @@ def analyze(x):
 
             volume_part = max(0.0, min(7.0, 3.5 + (vr - 1.0) * 7.0))
             oi_part = 5.0 if x["kind"] == "future" and x.get("oi", 0) > 0 else 0.0
-            return round(max(0.0, min(100.0, trend + mtrend + ftrend + price_ema + rsi_part + volume_part + oi_part + trigger_part + range_part)), 1)
+            raw = trend + mtrend + ftrend + price_ema + rsi_part + volume_part + oi_part + trigger_part + range_part
+            return round(max(0.0, min(100.0, raw)), 1), trigger_dist, range_pos
 
-        sl_score = score("LONG")
-        ss_score = score("SHORT")
+        sl_score, long_dist, long_range = score("LONG")
+        ss_score, short_dist, short_range = score("SHORT")
         side = "LONG" if sl_score >= ss_score else "SHORT"
         sc = max(sl_score, ss_score)
 
         trigger = trigger_long if side == "LONG" else trigger_short
+        trigger_dist = long_dist if side == "LONG" else short_dist
+        range_pos = long_range if side == "LONG" else short_range
 
         crossed = (
             any(z["close"] > trigger for z in f[-10:-1])
@@ -501,6 +506,11 @@ def analyze(x):
 
         hard = []
 
+        # Entry-location discipline: do not keep a candidate in the watchlist
+        # when price has moved too far from the planned trigger.
+        if trigger_dist > MAX_TRIGGER_ATR:
+            hard.append(f"триггер далеко ({trigger_dist:.1f} ATR)")
+
         if not (crossed and retest):
             hard.append("нет breakout+retest M5")
 
@@ -512,9 +522,40 @@ def analyze(x):
 
         mid_low = sup + (res - sup) * 0.30
         mid_high = sup + (res - sup) * 0.70
-
-        if res > sup and mid_low < price < mid_high:
+        in_mid = res > sup and mid_low < price < mid_high
+        if in_mid and not crossed:
             hard.append("середина диапазона")
+
+        if side == "LONG" and fs == "DOWN":
+            hard.append("M5 против LONG")
+        if side == "SHORT" and fs == "UP":
+            hard.append("M5 против SHORT")
+
+        # Score penalties make the ranking reflect entry quality, not just
+        # trend alignment. The directional trend can still rank highly, but
+        # an overextended/poorly positioned setup falls down the watchlist.
+        penalty = 0.0
+        if trigger_dist > 0.75:
+            penalty += min(10.0, (trigger_dist - 0.75) * 10.0)
+        if trigger_dist > 1.25:
+            penalty += 8.0
+        if in_mid and not crossed:
+            penalty += 8.0
+        if (side == "LONG" and fs == "DOWN") or (side == "SHORT" and fs == "UP"):
+            penalty += 8.0
+        if (side == "LONG" and hs != "UP") or (side == "SHORT" and hs != "DOWN"):
+            penalty += 12.0
+        sc = round(max(0.0, sc - penalty), 1)
+
+        if trigger_dist > MAX_WATCH_TRIGGER_ATR:
+            hard.append("движение ушло далеко от точки входа")
+
+        if crossed and retest:
+            setup_phase = "РЕТЕСТ ПОДТВЕРЖДЁН"
+        elif crossed:
+            setup_phase = "ПРОБОЙ ЕСТЬ — ЖДЁМ РЕТЕСТ"
+        else:
+            setup_phase = "ПРОБОЙ НЕ БЫЛ"
 
         entry = trigger
 
@@ -565,7 +606,9 @@ def analyze(x):
             "rr": 3,
             "volume_ratio": round(vr, 2),
             "liquidity": "OK" if x.get("liq", 0) > 10 else "CAUTION",
-            "watch": sc >= WATCH_SCORE and bool(hard),
+            "watch": sc >= WATCH_SCORE and bool(hard) and trigger_dist <= MAX_WATCH_TRIGGER_ATR,
+            "setup_phase": setup_phase,
+            "trigger_distance_atr": round(trigger_dist, 2),
             "trigger_condition": (
                 f"LONG: пробой и ретест {trigger:.6g}" if side == "LONG"
                 else f"SHORT: пробой и ретест {trigger:.6g}"
@@ -650,5 +693,15 @@ def run_scan():
             "market_mode": market_mode,
             "analysis_asof": max(asofs) if asofs else None,
             "history_mode": True,
+            "analysis_errors": [
+                {"symbol": x.get("symbol", "-"), "reason": x.get("reason", "-")}
+                for x in all_result
+                if str(x.get("reason", "")).lower().startswith("ошибка")
+            ],
+            "technical_skipped": [
+                {"symbol": x.get("symbol", "-"), "reason": x.get("reason", "-")}
+                for x in all_result
+                if "недостаточно свечей" in str(x.get("reason", "")).lower()
+            ],
         },
     }
