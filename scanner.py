@@ -1,28 +1,33 @@
 import os
 import math
 import re
+import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 BASE = "https://iss.moex.com/iss"
-TIMEOUT = int(os.getenv("MOEX_TIMEOUT", "20"))
-STAGE2 = int(os.getenv("STAGE2", "8"))
+TIMEOUT = int(os.getenv("MOEX_TIMEOUT", "15"))
 MAX_WORKERS = int(os.getenv("SCAN_WORKERS", "12"))
-M1_DAYS = int(os.getenv("M1_DAYS", "3"))
-H1_DAYS = int(os.getenv("H1_DAYS", "30"))
-# Analyze a wider pool than the TOP size. The most liquid FORTS contracts can
-# be newly listed/illiquid and have too little intraday history. If we analyze
-# only the first 8, all futures can disappear from TOP even when deeper
-# contracts have enough history. TOP itself is still limited to 3 in bot.py.
 STOCK_POOL = int(os.getenv("STOCK_POOL", "12"))
 FUTURES_POOL = int(os.getenv("FUTURES_POOL", "24"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "62"))
-WATCH_SCORE = float(os.getenv("WATCH_SCORE", "55"))
+WATCH_SCORE = float(os.getenv("WATCH_SCORE", "60"))
+MAX_TRIGGER_ATR = float(os.getenv("MAX_TRIGGER_ATR", "1.50"))
+MAX_WATCH_TRIGGER_ATR = float(os.getenv("MAX_WATCH_TRIGGER_ATR", "1.75"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.000001"))
+H1_DAYS = int(os.getenv("H1_DAYS", "14"))
+M1_DAYS = int(os.getenv("M1_DAYS", "3"))
+MSK = ZoneInfo("Europe/Moscow")
+_thread_local = threading.local()
 
-s = requests.Session()
-s.headers.update({"User-Agent": "AA-Analitik/5.0"})
+
+def session():
+    if not hasattr(_thread_local, "s"):
+        _thread_local.s = requests.Session()
+        _thread_local.s.headers.update({"User-Agent": "AA-Analitik/6.0"})
+    return _thread_local.s
 
 
 def rows(x):
@@ -40,7 +45,7 @@ def n(x, d=0.0):
 
 
 def get(url, p):
-    r = s.get(url, params=p, timeout=TIMEOUT)
+    r = session().get(url, params=p, timeout=TIMEOUT)
     r.raise_for_status()
     return r.json()
 
@@ -70,11 +75,7 @@ def atr(c, k=14):
     p = c[0]["close"]
     z = []
     for x in c[1:]:
-        z.append(max(
-            x["high"] - x["low"],
-            abs(x["high"] - p),
-            abs(x["low"] - p),
-        ))
+        z.append(max(x["high"] - x["low"], abs(x["high"] - p), abs(x["low"] - p)))
         p = x["close"]
     return sum(z[-k:]) / k
 
@@ -83,31 +84,28 @@ def parse_dt(v):
     if not v:
         return None
     try:
-        z = str(v).replace("Z", "+00:00")
+        z = str(v).strip().replace("Z", "+00:00")
         dt = datetime.fromisoformat(z)
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        return dt if dt.tzinfo else dt.replace(tzinfo=MSK)
     except Exception:
         return None
 
 
+def iso_msk(v):
+    dt = parse_dt(v)
+    return dt.astimezone(MSK).isoformat() if dt else None
+
+
 def engine_path(kind):
-    if kind == "stock":
-        return "engines/stock/markets/shares"
-    return "engines/futures/markets/forts"
+    return "engines/stock/markets/shares" if kind == "stock" else "engines/futures/markets/forts"
 
 
 def fetch_candles(sec, kind, interval, days):
-    """
-    MOEX ISS officially exposes standard candle intervals such as
-    1, 10, 60 and 24 minutes/days. 5 and 15 are NOT requested directly.
-    For M5/M15 we fetch 1-minute candles and aggregate locally.
-    """
     e = engine_path(kind)
     end = datetime.now(timezone.utc)
     start_dt = end - timedelta(days=days)
     out = []
     start = 0
-
     url = f"{BASE}/{e}/securities/{sec}/candles.json"
 
     while len(out) < 12000:
@@ -118,74 +116,49 @@ def fetch_candles(sec, kind, interval, days):
             "till": (end + timedelta(days=1)).date().isoformat(),
             "start": start,
         }
-
         j = get(url, p)
         block = j.get("candles", {})
         data = block.get("data", [])
         cols = block.get("columns", [])
-
         if not data:
             break
-
         for row in data:
             x = dict(zip(cols, row))
-            o = n(x.get("open"), None)
-            h = n(x.get("high"), None)
-            lo = n(x.get("low"), None)
-            c = n(x.get("close"), None)
+            o, h, lo, c = (n(x.get(k), None) for k in ("open", "high", "low", "close"))
             if None in (o, h, lo, c) or c <= 0:
                 continue
-
+            begin = iso_msk(x.get("begin"))
+            if not begin:
+                continue
             out.append({
-                "open": o,
-                "high": h,
-                "low": lo,
-                "close": c,
-                "volume": n(x.get("volume")),
-                "begin": x.get("begin"),
+                "open": o, "high": h, "low": lo, "close": c,
+                "volume": n(x.get("volume")), "begin": begin,
             })
-
-        # ISS may return relatively small pages (for example 20/100 rows).
-        # Do not treat a short page as the end of history; advance pagination
-        # until the endpoint returns an empty page or we reach the safety cap.
-        prev_start = start
+        prev = start
         start += len(data)
-        if start <= prev_start:
+        if start <= prev:
             break
 
-    uniq = {}
-    for x in out:
-        if x.get("begin"):
-            uniq[x["begin"]] = x
-
+    uniq = {x["begin"]: x for x in out if x.get("begin")}
     return [uniq[k] for k in sorted(uniq)]
 
 
-def aggregate_minutes(candles_1m, minutes):
+def aggregate_minutes(raw, minutes):
     if minutes == 1:
-        return candles_1m
-
+        return raw
     buckets = {}
     step = minutes * 60
-
-    for c in candles_1m:
+    for c in raw:
         dt = parse_dt(c.get("begin"))
         if not dt:
             continue
-
         ts = int(dt.timestamp())
         bucket = (ts // step) * step
-
         if bucket not in buckets:
             buckets[bucket] = {
-                "open": c["open"],
-                "high": c["high"],
-                "low": c["low"],
-                "close": c["close"],
-                "volume": c.get("volume", 0.0),
-                "begin": datetime.fromtimestamp(
-                    bucket, tz=timezone.utc
-                ).isoformat(),
+                "open": c["open"], "high": c["high"], "low": c["low"],
+                "close": c["close"], "volume": c.get("volume", 0.0),
+                "begin": datetime.fromtimestamp(bucket, tz=timezone.utc).astimezone(MSK).isoformat(),
             }
         else:
             b = buckets[bucket]
@@ -193,459 +166,243 @@ def aggregate_minutes(candles_1m, minutes):
             b["low"] = min(b["low"], c["low"])
             b["close"] = c["close"]
             b["volume"] += c.get("volume", 0.0)
-
     return [buckets[k] for k in sorted(buckets)]
 
 
-def candles(sec, kind, interval):
-    """Load only the minimum history needed for the indicator engine.
-
-    H1 uses the native 60-minute endpoint. M5/M15 are built from one shared
-    M1 download per instrument, so we never download the same minute history
-    twice. This is the main speed-up versus the previous scanner.
-    """
-    if interval == 60:
-        best = fetch_candles(sec, kind, 60, H1_DAYS)
-        if len(best) >= 60:
-            return best
-        # Weekend/illiquid fallback, but keep it bounded.
-        for days in (90, 365):
-            data = fetch_candles(sec, kind, 60, days)
-            if len(data) > len(best):
-                best = data
-            if len(best) >= 60:
-                break
-        return best
-
-    raw = fetch_candles(sec, kind, 1, M1_DAYS)
-    data = aggregate_minutes(raw, interval)
-    if len(data) >= 60:
-        return data
-
-    # Only deepen history when the short window genuinely lacks enough bars.
-    for days in (7, 30):
-        raw = fetch_candles(sec, kind, 1, days)
-        data = aggregate_minutes(raw, interval)
-        if len(data) > 60:
-            return data
-    return data
-
-
 def load_timeframes(sec, kind):
-    """Fetch H1 + one shared M1 stream, then derive M15/M5 locally."""
-    h = candles(sec, kind, 60)
+    """Fast path: one H1 request plus one shared M1 stream for M15/M5.
+    Only deepen history when the initial sample is genuinely insufficient.
+    """
+    h = fetch_candles(sec, kind, 60, H1_DAYS)
+    if len(h) < 60:
+        for days in (30, 90):
+            h2 = fetch_candles(sec, kind, 60, days)
+            if len(h2) > len(h):
+                h = h2
+            if len(h) >= 60:
+                break
+
     raw = fetch_candles(sec, kind, 1, M1_DAYS)
     m = aggregate_minutes(raw, 15)
     f = aggregate_minutes(raw, 5)
-
-    # Deepen only if the shared short window is insufficient.
     if len(m) < 40 or len(f) < 40:
-        raw = fetch_candles(sec, kind, 1, 7)
-        m = aggregate_minutes(raw, 15)
-        f = aggregate_minutes(raw, 5)
-
+        for days in (7, 20):
+            raw2 = fetch_candles(sec, kind, 1, days)
+            m2 = aggregate_minutes(raw2, 15)
+            f2 = aggregate_minutes(raw2, 5)
+            if len(m2) > len(m):
+                m = m2
+            if len(f2) > len(f):
+                f = f2
+            if len(m) >= 40 and len(f) >= 40:
+                break
     return h, m, f
 
 
 def snapshot(sec, kind):
     e = engine_path(kind)
-    j = get(
-        f"{BASE}/{e}/securities/{sec}.json",
-        {
-            "iss.meta": "off",
-            "iss.only": "marketdata,securities",
-        },
-    )
-    a = rows(j.get("marketdata"))
-    b = rows(j.get("securities"))
+    j = get(f"{BASE}/{e}/securities/{sec}.json", {"iss.meta": "off", "iss.only": "marketdata,securities"})
+    a = rows(j.get("marketdata")); b = rows(j.get("securities"))
     return {**(b[0] if b else {}), **(a[0] if a else {})}
 
 
 def discover_stocks():
-    j = get(
-        f"{BASE}/engines/stock/markets/shares/boards/TQBR/securities.json",
-        {
-            "iss.meta": "off",
-            "iss.only": "securities,marketdata",
-        },
-    )
-
+    j = get(f"{BASE}/engines/stock/markets/shares/boards/TQBR/securities.json", {"iss.meta": "off", "iss.only": "securities,marketdata"})
     ss = {x.get("SECID"): x for x in rows(j.get("securities"))}
     mm = {x.get("SECID"): x for x in rows(j.get("marketdata"))}
     out = []
-
     for sec, x in ss.items():
         m = mm.get(sec, {})
         last = n(m.get("LAST"))
-
         if not sec or last <= 0:
             continue
-
-        turnover = n(m.get("VALTODAY"))
-        trades = n(m.get("NUMTRADES"))
-        vol = n(m.get("VOLUME"))
-        liq = (
-            math.log1p(turnover)
-            + 0.4 * math.log1p(trades)
-            + 0.1 * math.log1p(vol)
-        )
-
-        out.append({
-            "kind": "stock",
-            "secid": sec,
-            "symbol": sec,
-            "name": x.get("SHORTNAME") or sec,
-            "last": last,
-            "liq": liq,
-            "lot": max(1, n(x.get("LOTSIZE"), 1)),
-        })
-
+        turnover, trades, vol = n(m.get("VALTODAY")), n(m.get("NUMTRADES")), n(m.get("VOLUME"))
+        liq = math.log1p(turnover) + 0.4 * math.log1p(trades) + 0.1 * math.log1p(vol)
+        out.append({"kind": "stock", "secid": sec, "symbol": sec, "name": x.get("SHORTNAME") or sec, "last": last, "liq": liq, "lot": max(1, n(x.get("LOTSIZE"), 1))})
     return sorted(out, key=lambda x: x["liq"], reverse=True)
 
 
 def discover_futures():
-    j = get(
-        f"{BASE}/engines/futures/markets/forts/securities.json",
-        {
-            "iss.meta": "off",
-            "iss.only": "securities",
-        },
-    )
-
+    j = get(f"{BASE}/engines/futures/markets/forts/securities.json", {"iss.meta": "off", "iss.only": "securities"})
     groups = {}
-
     for x in rows(j.get("securities")):
-        sec = x.get("SECID")
-        name = str(x.get("SHORTNAME") or sec or "")
-
+        sec = x.get("SECID"); name = str(x.get("SHORTNAME") or sec or "")
         if not sec:
             continue
-
         m = re.match(r"^(.+)-\d{1,2}\.\d{2}$", name)
         if not m:
             continue
-
         root = m.group(1)
-        vol = n(x.get("VOLUME"))
-        oi = n(x.get("OPENPOSITION"))
-        tr = n(x.get("NUMTRADES"))
-        liq = (
-            math.log1p(vol)
-            + 0.55 * math.log1p(oi)
-            + 0.25 * math.log1p(tr)
-        )
-
+        vol, oi, tr = n(x.get("VOLUME")), n(x.get("OPENPOSITION")), n(x.get("NUMTRADES"))
+        liq = math.log1p(vol) + 0.55 * math.log1p(oi) + 0.25 * math.log1p(tr)
         groups.setdefault(root, []).append({
-            "kind": "future",
-            "secid": sec,
-            "symbol": name,
-            "root": root,
-            "liq": liq,
-            "oi": oi,
-            "volume": vol,
-            "lot": max(1, n(x.get("LOTSIZE"), 1)),
-            "step": n(x.get("MINSTEP"), 0.01),
-            "step_price": n(x.get("STEPPRICE"), 0),
+            "kind": "future", "secid": sec, "symbol": name, "root": root,
+            "liq": liq, "oi": oi, "volume": vol, "lot": max(1, n(x.get("LOTSIZE"), 1)),
+            "step": n(x.get("MINSTEP"), 0.01), "step_price": n(x.get("STEPPRICE"), 0),
         })
-
-    return sorted(
-        [max(v, key=lambda x: x["liq"]) for v in groups.values()],
-        key=lambda x: x["liq"],
-        reverse=True,
-    )
-
-
-def stage1(x):
-    try:
-        q = snapshot(x["secid"], x["kind"])
-        z = x.copy()
-        z["last"] = n(q.get("LAST"), z.get("last", 0))
-        z["volume"] = n(q.get("VOLUME"), z.get("volume", 0))
-        z["oi"] = n(q.get("OPENPOSITION"), z.get("oi", 0))
-        z["turnover"] = n(q.get("VALTODAY"), 0)
-        z["trades"] = n(q.get("NUMTRADES"), 0)
-        z["step_price"] = n(
-            q.get("STEPPRICE"),
-            z.get("step_price", 0),
-        )
-        z["step"] = n(q.get("MINSTEP"), z.get("step", 0.01))
-        z["lot"] = max(
-            1,
-            n(q.get("LOTSIZE"), z.get("lot", 1)),
-        )
-        return z
-    except Exception as e:
-        z = x.copy()
-        z["error"] = str(e)
-        return z
+    return sorted([max(v, key=lambda x: x["liq"]) for v in groups.values()], key=lambda x: x["liq"], reverse=True)
 
 
 def analyze(x):
     try:
         h, m, f = load_timeframes(x["secid"], x["kind"])
-
         if min(len(h), len(m), len(f)) < 40:
-            return {
-                **x,
-                "status": "WAIT",
-                "score": 0,
-                "side": "WAIT",
-                "watch": False,
-                "reason": (
-                    f"Недостаточно свечей "
-                    f"(H1={len(h)}, M15={len(m)}, M5={len(f)})"
-                ),
-            }
+            return {**x, "status": "WAIT", "score": 0, "side": "WAIT", "watch": False,
+                    "reason": f"Недостаточно свечей (H1={len(h)}, M15={len(m)}, M5={len(f)})"}
 
         q = snapshot(x["secid"], x["kind"])
         last_quote = n(q.get("LAST"), 0)
         price = last_quote if last_quote > MIN_PRICE else f[-1]["close"]
         if price <= MIN_PRICE:
-            return {
-                **x, "status": "WAIT", "score": 0, "side": "WAIT",
-                "reason": "Невалидная цена: нет актуальной котировки и закрытия свечи",
-            }
+            return {**x, "status": "WAIT", "score": 0, "side": "WAIT", "watch": False,
+                    "reason": "Невалидная цена: нет котировки и закрытия свечи"}
 
-        H = [z["close"] for z in h]
-        M = [z["close"] for z in m]
-        F = [z["close"] for z in f]
+        # Refresh contract metadata once, but never let a zero LAST erase the candle price.
+        x = {**x,
+             "oi": n(q.get("OPENPOSITION"), x.get("oi", 0)),
+             "volume": n(q.get("VOLUME"), x.get("volume", 0)),
+             "step": n(q.get("MINSTEP"), x.get("step", 0.01)),
+             "step_price": n(q.get("STEPPRICE"), x.get("step_price", 0)),
+             "lot": max(1, n(q.get("LOTSIZE"), x.get("lot", 1)))}
 
-        h20, h50 = ema(H, 20), ema(H, 50)
-        m20, m50 = ema(M, 20), ema(M, 50)
-        f20, f50 = ema(F, 20), ema(F, 50)
+        H, M, F = [z["close"] for z in h], [z["close"] for z in m], [z["close"] for z in f]
+        h20, h50, m20, m50, f20, f50 = ema(H,20), ema(H,50), ema(M,20), ema(M,50), ema(F,20), ema(F,50)
+        hs = "UP" if h20 and h50 and h20 > h50 else "DOWN" if h20 and h50 and h20 < h50 else "FLAT"
+        ms = "UP" if m20 and m50 and m20 > m50 else "DOWN" if m20 and m50 and m20 < m50 else "FLAT"
+        fs = "UP" if f20 and f50 and f20 > f50 else "DOWN" if f20 and f50 and f20 < f50 else "FLAT"
 
-        hs = (
-            "UP" if h20 and h50 and h20 > h50
-            else "DOWN" if h20 and h50 and h20 < h50
-            else "FLAT"
-        )
-        ms = (
-            "UP" if m20 and m50 and m20 > m50
-            else "DOWN" if m20 and m50 and m20 < m50
-            else "FLAT"
-        )
-        fs = (
-            "UP" if f20 and f50 and f20 > f50
-            else "DOWN" if f20 and f50 and f20 < f50
-            else "FLAT"
-        )
-
-        a = max(
-            atr(m),
-            price * 0.003,
-            x.get("step", 0.01) * 5,
-        )
-
-        sup = min(z["low"] for z in m[-21:-1])
-        res = max(z["high"] for z in m[-21:-1])
-        hi = max(z["high"] for z in f[-13:-1])
-        lo = min(z["low"] for z in f[-13:-1])
-
+        a = max(atr(m), price * 0.003, x.get("step", 0.01) * 5)
+        sup = min(z["low"] for z in m[-21:-1]); res = max(z["high"] for z in m[-21:-1])
+        hi = max(z["high"] for z in f[-13:-1]); lo = min(z["low"] for z in f[-13:-1])
         avg = sum(z["volume"] for z in f[-21:-1]) / 20
         vr = f[-1]["volume"] / avg if avg else 1
         R = rsi(M)
+        trigger_long, trigger_short = hi, lo
 
         def score(side):
-            v = 0
-
             if side == "LONG":
-                v += 25 if hs == "UP" else -15 if hs == "DOWN" else 0
-                v += 15 if ms == "UP" else 0
-                v += 10 if fs == "UP" else 0
-                v += 10 if price > m20 else 0
-                v += 5 if R < 72 else -7 if R > 78 else 0
+                trend = 25 if hs == "UP" else 11 if hs == "FLAT" else 0
+                mtrend = 15 if ms == "UP" else 7 if ms == "FLAT" else 0
+                ftrend = 10 if fs == "UP" else 5 if fs == "FLAT" else 0
+                price_ema = max(0.0, min(10.0, 5.0 + ((price - m20) / max(a, MIN_PRICE)) * 3.0))
+                rsi_part = max(0.0, min(8.0, 8.0 - abs(R - 55.0) * 0.18))
+                trig = trigger_long; trigger_dist = abs(trig - price) / max(a, MIN_PRICE)
+                trigger_part = max(0.0, 10.0 - min(trigger_dist, 2.0) * 5.0)
+                range_pos = (price - sup) / max(res - sup, MIN_PRICE)
+                range_part = max(0.0, min(10.0, 10.0 * (1.0 - abs(range_pos - 0.35) / 0.65)))
             else:
-                v += 25 if hs == "DOWN" else -15 if hs == "UP" else 0
-                v += 15 if ms == "DOWN" else 0
-                v += 10 if fs == "DOWN" else 0
-                v += 10 if price < m20 else 0
-                v += 5 if R > 28 else -7 if R < 22 else 0
+                trend = 25 if hs == "DOWN" else 11 if hs == "FLAT" else 0
+                mtrend = 15 if ms == "DOWN" else 7 if ms == "FLAT" else 0
+                ftrend = 10 if fs == "DOWN" else 5 if fs == "FLAT" else 0
+                price_ema = max(0.0, min(10.0, 5.0 + ((m20 - price) / max(a, MIN_PRICE)) * 3.0))
+                rsi_part = max(0.0, min(8.0, 8.0 - abs(R - 45.0) * 0.18))
+                trig = trigger_short; trigger_dist = abs(price - trig) / max(a, MIN_PRICE)
+                trigger_part = max(0.0, 10.0 - min(trigger_dist, 2.0) * 5.0)
+                range_pos = (price - sup) / max(res - sup, MIN_PRICE)
+                range_part = max(0.0, min(10.0, 10.0 * (1.0 - abs(range_pos - 0.65) / 0.65)))
+            volume_part = max(0.0, min(7.0, 3.5 + (vr - 1.0) * 7.0))
+            oi_part = 5.0 if x["kind"] == "future" and x.get("oi", 0) > 0 else 0.0
+            raw = trend + mtrend + ftrend + price_ema + rsi_part + volume_part + oi_part + trigger_part + range_part
+            return round(max(0.0, min(100.0, raw)), 1), trigger_dist, range_pos
 
-            v += 7 if vr >= 1.15 else 0
-            v += 4 if x["kind"] == "future" and x.get("oi", 0) > 0 else 0
-
-            return max(0, min(100, v))
-
-        sl_score = score("LONG")
-        ss_score = score("SHORT")
+        sl_score, long_dist, long_range = score("LONG")
+        ss_score, short_dist, short_range = score("SHORT")
         side = "LONG" if sl_score >= ss_score else "SHORT"
         sc = max(sl_score, ss_score)
+        trigger = trigger_long if side == "LONG" else trigger_short
+        trigger_dist = long_dist if side == "LONG" else short_dist
+        range_pos = long_range if side == "LONG" else short_range
 
-        trigger = hi if side == "LONG" else lo
-
-        crossed = (
-            any(z["close"] > trigger for z in f[-10:-1])
-            if side == "LONG"
-            else any(z["close"] < trigger for z in f[-10:-1])
-        )
-
-        retest = (
-            any(
-                z["low"] <= trigger + a * 0.15
-                and z["close"] > trigger
-                for z in f[-4:]
-            )
-            if side == "LONG"
-            else any(
-                z["high"] >= trigger - a * 0.15
-                and z["close"] < trigger
-                for z in f[-4:]
-            )
-        )
+        crossed = any(z["close"] > trigger for z in f[-10:-1]) if side == "LONG" else any(z["close"] < trigger for z in f[-10:-1])
+        retest = (any(z["low"] <= trigger + a*0.15 and z["close"] > trigger for z in f[-4:]) if side == "LONG"
+                  else any(z["high"] >= trigger - a*0.15 and z["close"] < trigger for z in f[-4:]))
 
         hard = []
-
+        if trigger_dist > MAX_TRIGGER_ATR:
+            hard.append(f"триггер далеко ({trigger_dist:.1f} ATR)")
         if not (crossed and retest):
             hard.append("нет breakout+retest M5")
-
         if side == "LONG" and hs != "UP":
             hard.append("H1 не подтверждает LONG")
-
         if side == "SHORT" and hs != "DOWN":
             hard.append("H1 не подтверждает SHORT")
-
-        mid_low = sup + (res - sup) * 0.30
-        mid_high = sup + (res - sup) * 0.70
-
-        if mid_low < price < mid_high:
+        mid_low, mid_high = sup + (res-sup)*0.30, sup + (res-sup)*0.70
+        in_mid = res > sup and mid_low < price < mid_high
+        if in_mid and not crossed:
             hard.append("середина диапазона")
+        if side == "LONG" and fs == "DOWN":
+            hard.append("M5 против LONG")
+        if side == "SHORT" and fs == "UP":
+            hard.append("M5 против SHORT")
 
+        penalty = 0.0
+        if trigger_dist > 0.75: penalty += min(10.0, (trigger_dist-0.75)*10.0)
+        if trigger_dist > 1.25: penalty += 8.0
+        if in_mid and not crossed: penalty += 8.0
+        if (side == "LONG" and fs == "DOWN") or (side == "SHORT" and fs == "UP"): penalty += 8.0
+        if (side == "LONG" and hs != "UP") or (side == "SHORT" and hs != "DOWN"): penalty += 12.0
+        sc = round(max(0.0, sc - penalty), 1)
+        if trigger_dist > MAX_WATCH_TRIGGER_ATR:
+            hard.append("движение ушло далеко от точки входа")
+
+        setup_phase = "РЕТЕСТ ПОДТВЕРЖДЁН" if crossed and retest else "ПРОБОЙ ЕСТЬ — ЖДЁМ РЕТЕСТ" if crossed else "ПРОБОЙ НЕ БЫЛ"
         entry = trigger
-
         if side == "LONG":
-            slv = min(sup, entry - a * 0.45)
-            risk = max(entry - slv, 0.000001)
-            t1 = entry + risk * 1.5
-            t2 = entry + risk * 2.2
-            t3 = entry + risk * 3
+            slv = min(sup, entry - a*0.45); risk = max(entry-slv, MIN_PRICE)
+            t1, t2, t3 = entry+risk*1.5, entry+risk*2.2, entry+risk*3
         else:
-            slv = max(res, entry + a * 0.45)
-            risk = max(slv - entry, 0.000001)
-            t1 = entry - risk * 1.5
-            t2 = entry - risk * 2.2
-            t3 = entry - risk * 3
+            slv = max(res, entry + a*0.45); risk = max(slv-entry, MIN_PRICE)
+            t1, t2, t3 = entry-risk*1.5, entry-risk*2.2, entry-risk*3
 
-        if sc >= MIN_SCORE and not hard:
-            status = side
-        else:
-            status = "WAIT"
-
+        status = side if sc >= MIN_SCORE and not hard else "WAIT"
         return {
-            **x,
-            "status": status,
-            "score": round(sc, 1),
-            "long_score": round(sl_score, 1),
-            "short_score": round(ss_score, 1),
-            "side": side,
-            "price": price,
-            "regime": (
-                "TREND UP" if hs == "UP"
-                else "TREND DOWN" if hs == "DOWN"
-                else "RANGE"
-            ),
-            "h1": hs,
-            "m15": ms,
-            "m5": fs,
+            **x, "status": status, "score": sc, "long_score": sl_score, "short_score": ss_score,
+            "side": side, "regime": "TREND UP" if hs == "UP" else "TREND DOWN" if hs == "DOWN" else "RANGE",
+            "h1": hs, "m15": ms, "m5": fs,
             "data_asof": f[-1].get("begin") or m[-1].get("begin") or h[-1].get("begin"),
-            "rsi": round(R, 1),
-            "support": sup,
-            "resistance": res,
-            "trigger": trigger,
-            "entry": entry,
-            "sl": slv,
-            "tp1": t1,
-            "tp2": t2,
-            "tp3": t3,
-            "rr": 3,
-            "volume_ratio": round(vr, 2),
-            "liquidity": "OK" if x.get("liq", 0) > 10 else "CAUTION",
-            "watch": sc >= WATCH_SCORE and bool(hard),
-            "trigger_condition": (
-                f"LONG: пробой и ретест {trigger:.6g}" if side == "LONG"
-                else f"SHORT: пробой и ретест {trigger:.6g}"
-            ),
-            "reason": (
-                "; ".join(hard)
-                if hard
-                else "подтверждённый сетап"
-            ),
+            "rsi": round(R,1), "support": sup, "resistance": res, "trigger": trigger, "entry": entry,
+            "sl": slv, "tp1": t1, "tp2": t2, "tp3": t3, "rr": 3,
+            "volume_ratio": round(vr,2), "liquidity": "OK" if x.get("liq",0) > 10 else "CAUTION",
+            "watch": sc >= WATCH_SCORE and bool(hard) and trigger_dist <= MAX_WATCH_TRIGGER_ATR,
+            "setup_phase": setup_phase, "trigger_distance_atr": round(trigger_dist,2),
+            "trigger_condition": f"{side}: пробой и ретест {trigger:.6g}",
+            "reason": "; ".join(hard) if hard else "подтверждённый сетап",
         }
-
     except Exception as e:
-        return {
-            **x,
-            "status": "WAIT",
-            "score": 0,
-            "side": "WAIT",
-            "watch": False,
-            "reason": "Ошибка: " + str(e),
-        }
+        return {**x, "status":"WAIT", "score":0, "side":"WAIT", "watch":False, "reason":"Ошибка: "+str(e)}
 
 
 def run_scan():
-    # Discovery endpoints already provide the liquidity ranking.
-    # Do NOT snapshot every security here: 400+ sequential ISS requests
-    # were making /scan take several minutes. Only the final candidates
-    # need detailed snapshots/candles in analyze().
-    stocks = discover_stocks()
-    futures = discover_futures()
-
-    # STAGE2 controls TOP size/quality, but the analysis pool must be wider.
-    # This prevents technically unusable front contracts from consuming the
-    # entire futures quota.
-    candidates = (
-        stocks[:STOCK_POOL]
-        + futures[:FUTURES_POOL]
-    )
-
+    stocks = discover_stocks(); futures = discover_futures()
+    candidates = stocks[:STOCK_POOL] + futures[:FUTURES_POOL]
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         result = list(ex.map(analyze, candidates))
 
-    all_result = result
-    asofs = [x.get("data_asof") for x in all_result if x.get("data_asof")]
-    # The bot is primarily a research/reporting service. Outside the MOEX
-    # trading window we label the report historical so the last candle is
-    # never presented as a live quote. Moscow time is UTC+3 in this setup.
-    now_msk = datetime.now(timezone.utc) + timedelta(hours=3)
-    weekday = now_msk.weekday()
-    minutes = now_msk.hour * 60 + now_msk.minute
-    market_open = (weekday < 5 and 10*60 <= minutes <= 23*60+50)
+    asofs = [parse_dt(x.get("data_asof")) for x in result if x.get("data_asof")]
+    asofs = [x for x in asofs if x]
+    now_msk = datetime.now(timezone.utc).astimezone(MSK)
+    weekday, minutes = now_msk.weekday(), now_msk.hour*60 + now_msk.minute
+    market_open = weekday < 5 and 10*60 <= minutes <= 23*60+50
     market_mode = "LIVE_OR_LATEST" if market_open else "HISTORICAL"
 
+    def side_sorted(side, kind=None, statuses=("LONG","SHORT")):
+        return sorted([x for x in result if x.get("status") == side and (kind is None or x.get("kind") == kind)], key=lambda x:x.get("score",0), reverse=True)
+
+    longs = sorted([x for x in result if x.get("status")=="LONG"], key=lambda x:x.get("score",0), reverse=True)
+    shorts = sorted([x for x in result if x.get("status")=="SHORT"], key=lambda x:x.get("score",0), reverse=True)
+    watch = sorted([x for x in result if x.get("status")=="WAIT" and x.get("watch")], key=lambda x:x.get("score",0), reverse=True)
+    errors = [{"symbol":x.get("symbol","-"),"reason":x.get("reason","-")} for x in result if str(x.get("reason","")).lower().startswith("ошибка")]
+    skipped = [{"symbol":x.get("symbol","-"),"reason":x.get("reason","-")} for x in result if "недостаточно свечей" in str(x.get("reason","")).lower()]
+
     return {
-        "longs": sorted(
-            [x for x in result if x["status"] == "LONG"],
-            key=lambda x: x["score"],
-            reverse=True,
-        ),
-        "shorts": sorted(
-            [x for x in result if x["status"] == "SHORT"],
-            key=lambda x: x["score"],
-            reverse=True,
-        ),
-        "watch": sorted(
-            [x for x in result if x["status"] == "WAIT"],
-            key=lambda x: x["score"],
-            reverse=True,
-        ),
-        "stocks": [
-            x for x in result if x["kind"] == "stock"
-        ],
-        "futures": [
-            x for x in result if x["kind"] == "future"
-        ],
+        "longs": longs, "shorts": shorts, "watch": watch,
+        "stocks": [x for x in result if x.get("kind")=="stock"],
+        "futures": [x for x in result if x.get("kind")=="future"],
         "meta": {
-            "stocks": len(stocks),
-            "futures": len(futures),
-            "stage2": STAGE2,
-            "stock_pool": STOCK_POOL,
-            "futures_pool": FUTURES_POOL,
-            "workers": MAX_WORKERS,
-            "m1_days": M1_DAYS,
-            "h1_days": H1_DAYS,
-            "generated": datetime.now(timezone.utc).isoformat(),
-            "market_mode": market_mode,
-            "analysis_asof": max(asofs) if asofs else None,
-            "history_mode": True,
-        },
+            "stocks":len(stocks), "futures":len(futures), "stock_pool":STOCK_POOL, "futures_pool":FUTURES_POOL,
+            "workers":MAX_WORKERS, "m1_days":M1_DAYS, "h1_days":H1_DAYS,
+            "generated":datetime.now(timezone.utc).isoformat(), "market_mode":market_mode,
+            "analysis_asof":max(asofs).isoformat() if asofs else None, "history_mode":True,
+            "analysis_errors":errors, "technical_skipped":skipped,
+        }
     }
