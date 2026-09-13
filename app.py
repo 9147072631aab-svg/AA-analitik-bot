@@ -16,9 +16,36 @@ WEBHOOK_PATH = "/telegram"
 WEBHOOK_URL = PUBLIC_URL + WEBHOOK_PATH
 
 
+def telegram_api(method, payload=None):
+    if not TOKEN:
+        return {"ok": False, "description": "TELEGRAM_BOT_TOKEN is not set"}
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/{method}",
+            json=payload or {},
+            timeout=20,
+        )
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "description": repr(e)}
+
+
+def set_webhook():
+    result = telegram_api("setWebhook", {"url": WEBHOOK_URL})
+    print("Webhook setup:", result, flush=True)
+    return result
+
+
 @app.get("/")
 def home():
-    return "AA Analitik Bot is running", 200
+    # Opening the Render URL also refreshes the Telegram webhook.
+    result = set_webhook()
+    return {
+        "ok": True,
+        "service": "AA Analitik Bot",
+        "webhook_url": WEBHOOK_URL,
+        "webhook_setup": result.get("ok", False),
+    }, 200
 
 
 @app.get("/health")
@@ -26,34 +53,41 @@ def health():
     return {"ok": True}, 200
 
 
-def set_webhook():
-    if not TOKEN:
-        print("TELEGRAM_BOT_TOKEN is not set")
-        return
+@app.get("/setup")
+def setup():
+    # Open https://aa-analitik-bot.onrender.com/setup once after deploy.
+    result = set_webhook()
+    return result, 200 if result.get("ok") else 500
 
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/setWebhook",
-            json={"url": WEBHOOK_URL},
-            timeout=20,
-        )
-        print("Webhook:", r.status_code, r.text)
-    except Exception as e:
-        print("Webhook setup error:", repr(e))
+
+@app.get("/telegram-status")
+def telegram_status():
+    # Diagnostics without exposing the bot token.
+    result = telegram_api("getWebhookInfo")
+    if result.get("ok"):
+        data = result.get("result", {})
+        data.pop("url", None)
+        return {
+            "ok": True,
+            "webhook_expected": WEBHOOK_URL,
+            "webhook_info": data,
+        }, 200
+    return result, 500
 
 
 def process_update(update):
     try:
         handle(update)
     except Exception as e:
-        print("Update processing error:", repr(e))
+        print("Update processing error:", repr(e), flush=True)
 
 
 @app.post(WEBHOOK_PATH)
 def telegram():
     update = request.get_json(silent=True) or {}
 
-    # Telegram gets 200 immediately; /scan continues in background.
+    # Telegram receives HTTP 200 immediately.
+    # /scan can continue in the background without blocking the webhook.
     threading.Thread(
         target=process_update,
         args=(update,),
@@ -63,7 +97,7 @@ def telegram():
     return "ok", 200
 
 
-# Register webhook after the application starts.
+# Register automatically when Render starts the process.
 threading.Thread(target=set_webhook, daemon=True).start()
 
 
