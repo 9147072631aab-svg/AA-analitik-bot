@@ -4,23 +4,22 @@ import re
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
 
 BASE = "https://iss.moex.com/iss"
 TIMEOUT = int(os.getenv("MOEX_TIMEOUT", "20"))
 STAGE2 = int(os.getenv("STAGE2", "8"))
+MAX_WORKERS = int(os.getenv("SCAN_WORKERS", "12"))
+M1_DAYS = int(os.getenv("M1_DAYS", "3"))
+H1_DAYS = int(os.getenv("H1_DAYS", "30"))
 # Analyze a wider pool than the TOP size. The most liquid FORTS contracts can
 # be newly listed/illiquid and have too little intraday history. If we analyze
 # only the first 8, all futures can disappear from TOP even when deeper
 # contracts have enough history. TOP itself is still limited to 3 in bot.py.
-STOCK_POOL = int(os.getenv("STOCK_POOL", "16"))
-FUTURES_POOL = int(os.getenv("FUTURES_POOL", "40"))
+STOCK_POOL = int(os.getenv("STOCK_POOL", "12"))
+FUTURES_POOL = int(os.getenv("FUTURES_POOL", "24"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "62"))
-WATCH_SCORE = float(os.getenv("WATCH_SCORE", "60"))
-MAX_TRIGGER_ATR = float(os.getenv("MAX_TRIGGER_ATR", "1.50"))
-MAX_WATCH_TRIGGER_ATR = float(os.getenv("MAX_WATCH_TRIGGER_ATR", "1.75"))
+WATCH_SCORE = float(os.getenv("WATCH_SCORE", "55"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.000001"))
-MSK = ZoneInfo("Europe/Moscow")
 
 s = requests.Session()
 s.headers.update({"User-Agent": "AA-Analitik/5.0"})
@@ -81,15 +80,12 @@ def atr(c, k=14):
 
 
 def parse_dt(v):
-    """Parse MOEX timestamps. ISS commonly returns candle times without an offset.
-    Those timestamps are Moscow exchange time, not UTC.
-    """
     if not v:
         return None
     try:
-        z = str(v).strip().replace("Z", "+00:00")
+        z = str(v).replace("Z", "+00:00")
         dt = datetime.fromisoformat(z)
-        return dt if dt.tzinfo else dt.replace(tzinfo=MSK)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
         return None
 
@@ -202,42 +198,53 @@ def aggregate_minutes(candles_1m, minutes):
 
 
 def candles(sec, kind, interval):
-    """Load enough history for analysis, including when the exchange is closed.
+    """Load only the minimum history needed for the indicator engine.
 
-    We deliberately retry with a deeper historical window instead of treating
-    a short recent sample as a reason to give up. This is important on
-    weekends/holidays and for contracts whose recent trading history is sparse.
+    H1 uses the native 60-minute endpoint. M5/M15 are built from one shared
+    M1 download per instrument, so we never download the same minute history
+    twice. This is the main speed-up versus the previous scanner.
     """
     if interval == 60:
-        best = []
-        for days in (14, 45, 120, 365):
+        best = fetch_candles(sec, kind, 60, H1_DAYS)
+        if len(best) >= 60:
+            return best
+        # Weekend/illiquid fallback, but keep it bounded.
+        for days in (90, 365):
             data = fetch_candles(sec, kind, 60, days)
             if len(data) > len(best):
                 best = data
-            if len(data) >= 60:
-                return data
-
-        # Final fallback: build H1 from minute history.
-        for days in (7, 30, 90, 365):
-            raw = fetch_candles(sec, kind, 1, days)
-            data = aggregate_minutes(raw, 60)
-            if len(data) > len(best):
-                best = data
-            if len(data) >= 60:
-                return data
+            if len(best) >= 60:
+                break
         return best
 
-    # M5/M15 are always built locally from M1. Use progressively deeper
-    # history so a closed market still has a meaningful last-session sample.
-    best = []
-    for days in (5, 20, 60, 180, 365):
+    raw = fetch_candles(sec, kind, 1, M1_DAYS)
+    data = aggregate_minutes(raw, interval)
+    if len(data) >= 60:
+        return data
+
+    # Only deepen history when the short window genuinely lacks enough bars.
+    for days in (7, 30):
         raw = fetch_candles(sec, kind, 1, days)
         data = aggregate_minutes(raw, interval)
-        if len(data) > len(best):
-            best = data
-        if len(data) >= 60:
+        if len(data) > 60:
             return data
-    return best
+    return data
+
+
+def load_timeframes(sec, kind):
+    """Fetch H1 + one shared M1 stream, then derive M15/M5 locally."""
+    h = candles(sec, kind, 60)
+    raw = fetch_candles(sec, kind, 1, M1_DAYS)
+    m = aggregate_minutes(raw, 15)
+    f = aggregate_minutes(raw, 5)
+
+    # Deepen only if the shared short window is insufficient.
+    if len(m) < 40 or len(f) < 40:
+        raw = fetch_candles(sec, kind, 1, 7)
+        m = aggregate_minutes(raw, 15)
+        f = aggregate_minutes(raw, 5)
+
+    return h, m, f
 
 
 def snapshot(sec, kind):
@@ -375,9 +382,7 @@ def stage1(x):
 
 def analyze(x):
     try:
-        h = candles(x["secid"], x["kind"], 60)
-        m = candles(x["secid"], x["kind"], 15)
-        f = candles(x["secid"], x["kind"], 5)
+        h, m, f = load_timeframes(x["secid"], x["kind"])
 
         if min(len(h), len(m), len(f)) < 40:
             return {
@@ -440,49 +445,33 @@ def analyze(x):
         vr = f[-1]["volume"] / avg if avg else 1
         R = rsi(M)
 
-        trigger_long = hi
-        trigger_short = lo
-
         def score(side):
-            # Continuous quality score 0..100. This is a ranking metric, not
-            # a probability. Setup-specific penalties are applied below so a
-            # strong trend cannot hide a poor/overextended entry location.
+            v = 0
+
             if side == "LONG":
-                trend = 25 if hs == "UP" else 11 if hs == "FLAT" else 0
-                mtrend = 15 if ms == "UP" else 7 if ms == "FLAT" else 0
-                ftrend = 10 if fs == "UP" else 5 if fs == "FLAT" else 0
-                price_ema = max(0.0, min(10.0, 5.0 + ((price - m20) / max(a, MIN_PRICE)) * 3.0))
-                rsi_part = max(0.0, min(8.0, 8.0 - abs(R - 55.0) * 0.18))
-                trig = trigger_long
-                trigger_dist = abs(trig - price) / max(a, MIN_PRICE)
-                trigger_part = max(0.0, 10.0 - min(trigger_dist, 2.0) * 5.0)
-                range_pos = (price - sup) / max(res - sup, MIN_PRICE)
-                range_part = max(0.0, min(10.0, 10.0 * (1.0 - abs(range_pos - 0.35) / 0.65)))
+                v += 25 if hs == "UP" else -15 if hs == "DOWN" else 0
+                v += 15 if ms == "UP" else 0
+                v += 10 if fs == "UP" else 0
+                v += 10 if price > m20 else 0
+                v += 5 if R < 72 else -7 if R > 78 else 0
             else:
-                trend = 25 if hs == "DOWN" else 11 if hs == "FLAT" else 0
-                mtrend = 15 if ms == "DOWN" else 7 if ms == "FLAT" else 0
-                ftrend = 10 if fs == "DOWN" else 5 if fs == "FLAT" else 0
-                price_ema = max(0.0, min(10.0, 5.0 + ((m20 - price) / max(a, MIN_PRICE)) * 3.0))
-                rsi_part = max(0.0, min(8.0, 8.0 - abs(R - 45.0) * 0.18))
-                trig = trigger_short
-                trigger_dist = abs(price - trig) / max(a, MIN_PRICE)
-                trigger_part = max(0.0, 10.0 - min(trigger_dist, 2.0) * 5.0)
-                range_pos = (price - sup) / max(res - sup, MIN_PRICE)
-                range_part = max(0.0, min(10.0, 10.0 * (1.0 - abs(range_pos - 0.65) / 0.65)))
+                v += 25 if hs == "DOWN" else -15 if hs == "UP" else 0
+                v += 15 if ms == "DOWN" else 0
+                v += 10 if fs == "DOWN" else 0
+                v += 10 if price < m20 else 0
+                v += 5 if R > 28 else -7 if R < 22 else 0
 
-            volume_part = max(0.0, min(7.0, 3.5 + (vr - 1.0) * 7.0))
-            oi_part = 5.0 if x["kind"] == "future" and x.get("oi", 0) > 0 else 0.0
-            raw = trend + mtrend + ftrend + price_ema + rsi_part + volume_part + oi_part + trigger_part + range_part
-            return round(max(0.0, min(100.0, raw)), 1), trigger_dist, range_pos
+            v += 7 if vr >= 1.15 else 0
+            v += 4 if x["kind"] == "future" and x.get("oi", 0) > 0 else 0
 
-        sl_score, long_dist, long_range = score("LONG")
-        ss_score, short_dist, short_range = score("SHORT")
+            return max(0, min(100, v))
+
+        sl_score = score("LONG")
+        ss_score = score("SHORT")
         side = "LONG" if sl_score >= ss_score else "SHORT"
         sc = max(sl_score, ss_score)
 
-        trigger = trigger_long if side == "LONG" else trigger_short
-        trigger_dist = long_dist if side == "LONG" else short_dist
-        range_pos = long_range if side == "LONG" else short_range
+        trigger = hi if side == "LONG" else lo
 
         crossed = (
             any(z["close"] > trigger for z in f[-10:-1])
@@ -506,11 +495,6 @@ def analyze(x):
 
         hard = []
 
-        # Entry-location discipline: do not keep a candidate in the watchlist
-        # when price has moved too far from the planned trigger.
-        if trigger_dist > MAX_TRIGGER_ATR:
-            hard.append(f"триггер далеко ({trigger_dist:.1f} ATR)")
-
         if not (crossed and retest):
             hard.append("нет breakout+retest M5")
 
@@ -522,40 +506,9 @@ def analyze(x):
 
         mid_low = sup + (res - sup) * 0.30
         mid_high = sup + (res - sup) * 0.70
-        in_mid = res > sup and mid_low < price < mid_high
-        if in_mid and not crossed:
+
+        if mid_low < price < mid_high:
             hard.append("середина диапазона")
-
-        if side == "LONG" and fs == "DOWN":
-            hard.append("M5 против LONG")
-        if side == "SHORT" and fs == "UP":
-            hard.append("M5 против SHORT")
-
-        # Score penalties make the ranking reflect entry quality, not just
-        # trend alignment. The directional trend can still rank highly, but
-        # an overextended/poorly positioned setup falls down the watchlist.
-        penalty = 0.0
-        if trigger_dist > 0.75:
-            penalty += min(10.0, (trigger_dist - 0.75) * 10.0)
-        if trigger_dist > 1.25:
-            penalty += 8.0
-        if in_mid and not crossed:
-            penalty += 8.0
-        if (side == "LONG" and fs == "DOWN") or (side == "SHORT" and fs == "UP"):
-            penalty += 8.0
-        if (side == "LONG" and hs != "UP") or (side == "SHORT" and hs != "DOWN"):
-            penalty += 12.0
-        sc = round(max(0.0, sc - penalty), 1)
-
-        if trigger_dist > MAX_WATCH_TRIGGER_ATR:
-            hard.append("движение ушло далеко от точки входа")
-
-        if crossed and retest:
-            setup_phase = "РЕТЕСТ ПОДТВЕРЖДЁН"
-        elif crossed:
-            setup_phase = "ПРОБОЙ ЕСТЬ — ЖДЁМ РЕТЕСТ"
-        else:
-            setup_phase = "ПРОБОЙ НЕ БЫЛ"
 
         entry = trigger
 
@@ -606,9 +559,7 @@ def analyze(x):
             "rr": 3,
             "volume_ratio": round(vr, 2),
             "liquidity": "OK" if x.get("liq", 0) > 10 else "CAUTION",
-            "watch": sc >= WATCH_SCORE and bool(hard) and trigger_dist <= MAX_WATCH_TRIGGER_ATR,
-            "setup_phase": setup_phase,
-            "trigger_distance_atr": round(trigger_dist, 2),
+            "watch": sc >= WATCH_SCORE and bool(hard),
             "trigger_condition": (
                 f"LONG: пробой и ретест {trigger:.6g}" if side == "LONG"
                 else f"SHORT: пробой и ретест {trigger:.6g}"
@@ -647,7 +598,7 @@ def run_scan():
         + futures[:FUTURES_POOL]
     )
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         result = list(ex.map(analyze, candidates))
 
     all_result = result
@@ -655,7 +606,7 @@ def run_scan():
     # The bot is primarily a research/reporting service. Outside the MOEX
     # trading window we label the report historical so the last candle is
     # never presented as a live quote. Moscow time is UTC+3 in this setup.
-    now_msk = datetime.now(timezone.utc).astimezone(MSK)
+    now_msk = datetime.now(timezone.utc) + timedelta(hours=3)
     weekday = now_msk.weekday()
     minutes = now_msk.hour * 60 + now_msk.minute
     market_open = (weekday < 5 and 10*60 <= minutes <= 23*60+50)
@@ -689,19 +640,12 @@ def run_scan():
             "stage2": STAGE2,
             "stock_pool": STOCK_POOL,
             "futures_pool": FUTURES_POOL,
+            "workers": MAX_WORKERS,
+            "m1_days": M1_DAYS,
+            "h1_days": H1_DAYS,
             "generated": datetime.now(timezone.utc).isoformat(),
             "market_mode": market_mode,
             "analysis_asof": max(asofs) if asofs else None,
             "history_mode": True,
-            "analysis_errors": [
-                {"symbol": x.get("symbol", "-"), "reason": x.get("reason", "-")}
-                for x in all_result
-                if str(x.get("reason", "")).lower().startswith("ошибка")
-            ],
-            "technical_skipped": [
-                {"symbol": x.get("symbol", "-"), "reason": x.get("reason", "-")}
-                for x in all_result
-                if "недостаточно свечей" in str(x.get("reason", "")).lower()
-            ],
         },
     }
