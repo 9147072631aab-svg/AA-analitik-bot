@@ -298,8 +298,8 @@ def analyze(root, contract):
             "status": "WAIT",
             "rating": 0,
             "reason": (
-                f"Недостаточно данных: H1={len(h1)} (нужно 60), "
-                f"M15={len(m15)} (нужно 55), M5={len(m5)} (нужно 100)."
+                f"ÐÐµÐ´Ð¾ÑÑÐ°ÑÐ¾ÑÐ½Ð¾ Ð´Ð°Ð½Ð½ÑÑ: H1={len(h1)} (Ð½ÑÐ¶Ð½Ð¾ 60), "
+                f"M15={len(m15)} (Ð½ÑÐ¶Ð½Ð¾ 55), M5={len(m5)} (Ð½ÑÐ¶Ð½Ð¾ 100)."
             ),
         }
 
@@ -419,35 +419,35 @@ def analyze(root, contract):
     if not side:
         reasons = []
         if h1_state == "FLAT":
-            reasons.append("H1 без направленного тренда")
+            reasons.append("H1 Ð±ÐµÐ· Ð½Ð°Ð¿ÑÐ°Ð²Ð»ÐµÐ½Ð½Ð¾Ð³Ð¾ ÑÑÐµÐ½Ð´Ð°")
         elif h1_state == "UP":
             if not long_m15_setup:
-                reasons.append("LONG: цена не в рабочей зоне M15")
+                reasons.append("LONG: ÑÐµÐ½Ð° Ð½Ðµ Ð² ÑÐ°Ð±Ð¾ÑÐµÐ¹ Ð·Ð¾Ð½Ðµ M15")
             elif not long_confirmed:
-                reasons.append(f"LONG: нужен пробой {round(long_trigger, 6)}, закрытие M5 и ретест")
+                reasons.append(f"LONG: Ð½ÑÐ¶ÐµÐ½ Ð¿ÑÐ¾Ð±Ð¾Ð¹ {round(long_trigger, 6)}, Ð·Ð°ÐºÑÑÑÐ¸Ðµ M5 Ð¸ ÑÐµÑÐµÑÑ")
             elif not vol_ok:
-                reasons.append("LONG: объём не подтверждает движение")
+                reasons.append("LONG: Ð¾Ð±ÑÑÐ¼ Ð½Ðµ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´Ð°ÐµÑ Ð´Ð²Ð¸Ð¶ÐµÐ½Ð¸Ðµ")
             else:
-                reasons.append("LONG: ждём полного подтверждения")
+                reasons.append("LONG: Ð¶Ð´ÑÐ¼ Ð¿Ð¾Ð»Ð½Ð¾Ð³Ð¾ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÐµÐ½Ð¸Ñ")
         elif h1_state == "DOWN":
             if not short_m15_setup:
-                reasons.append("SHORT: цена не в рабочей зоне M15")
+                reasons.append("SHORT: ÑÐµÐ½Ð° Ð½Ðµ Ð² ÑÐ°Ð±Ð¾ÑÐµÐ¹ Ð·Ð¾Ð½Ðµ M15")
             elif not short_confirmed:
-                reasons.append(f"SHORT: нужен пробой {round(short_trigger, 6)}, закрытие M5 и ретест")
+                reasons.append(f"SHORT: Ð½ÑÐ¶ÐµÐ½ Ð¿ÑÐ¾Ð±Ð¾Ð¹ {round(short_trigger, 6)}, Ð·Ð°ÐºÑÑÑÐ¸Ðµ M5 Ð¸ ÑÐµÑÐµÑÑ")
             elif not vol_ok:
-                reasons.append("SHORT: объём не подтверждает движение")
+                reasons.append("SHORT: Ð¾Ð±ÑÑÐ¼ Ð½Ðµ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´Ð°ÐµÑ Ð´Ð²Ð¸Ð¶ÐµÐ½Ð¸Ðµ")
             else:
-                reasons.append("SHORT: ждём полного подтверждения")
+                reasons.append("SHORT: Ð¶Ð´ÑÐ¼ Ð¿Ð¾Ð»Ð½Ð¾Ð³Ð¾ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÐµÐ½Ð¸Ñ")
 
         if not vol_ok and len(reasons) < 2:
-            reasons.append("объём не подтверждает движение")
+            reasons.append("Ð¾Ð±ÑÑÐ¼ Ð½Ðµ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´Ð°ÐµÑ Ð´Ð²Ð¸Ð¶ÐµÐ½Ð¸Ðµ")
 
         base.update({"status": "WAIT", "rating": 5.0, "reason": "; ".join(reasons[:2])})
         return base
 
     risk = abs(entry - sl)
     if risk <= 0:
-        return {**base, "status": "NO TRADE", "rating": 0, "reason": "Некорректный стоп."}
+        return {**base, "status": "NO TRADE", "rating": 0, "reason": "ÐÐµÐºÐ¾ÑÑÐµÐºÑÐ½ÑÐ¹ ÑÑÐ¾Ð¿."}
 
     f = (lambda k: entry + risk * k) if side == "LONG" else (lambda k: entry - risk * k)
 
@@ -481,8 +481,8 @@ def analyze(root, contract):
         "setup": setup,
         "entry": round(entry, 6),
         "trigger": (
-            f"пробой + закрытие M5 {'выше' if side == 'LONG' else 'ниже'} "
-            f"{round(trigger_level, 6)} + ретест + отбой"
+            f"Ð¿ÑÐ¾Ð±Ð¾Ð¹ + Ð·Ð°ÐºÑÑÑÐ¸Ðµ M5 {'Ð²ÑÑÐµ' if side == 'LONG' else 'Ð½Ð¸Ð¶Ðµ'} "
+            f"{round(trigger_level, 6)} + ÑÐµÑÐµÑÑ + Ð¾ÑÐ±Ð¾Ð¹"
         ),
         "sl": round(sl, 6),
         "tp1": round(f(1.5), 6),
@@ -504,7 +504,7 @@ def run_scan(selected=None):
         return {
             "signals": [],
             "all": [],
-            "errors": [f"MOEX ISS недоступен: {type(e).__name__}"],
+            "errors": [f"MOEX ISS Ð½ÐµÐ´Ð¾ÑÑÑÐ¿ÐµÐ½: {type(e).__name__}"],
         }
 
     all_results, errors = [], []
@@ -517,7 +517,7 @@ def run_scan(selected=None):
                 "symbol": root,
                 "status": "WAIT",
                 "rating": 0,
-                "reason": "Активный контракт не найден через MOEX ISS.",
+                "reason": "ÐÐºÑÐ¸Ð²Ð½ÑÐ¹ ÐºÐ¾Ð½ÑÑÐ°ÐºÑ Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½ ÑÐµÑÐµÐ· MOEX ISS.",
             })
             continue
 
@@ -529,7 +529,7 @@ def run_scan(selected=None):
                 "symbol": c["name"],
                 "status": "WAIT",
                 "rating": 0,
-                "reason": "Ошибка данных MOEX; сигнал не формируется.",
+                "reason": "ÐÑÐ¸Ð±ÐºÐ° Ð´Ð°Ð½Ð½ÑÑ MOEX; ÑÐ¸Ð³Ð½Ð°Ð» Ð½Ðµ ÑÐ¾ÑÐ¼Ð¸ÑÑÐµÑÑÑ.",
             })
 
     signals = sorted(
