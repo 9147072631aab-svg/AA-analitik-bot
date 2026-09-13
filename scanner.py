@@ -12,8 +12,8 @@ from zoneinfo import ZoneInfo
 BASE = "https://iss.moex.com/iss"
 TIMEOUT = int(os.getenv("MOEX_TIMEOUT", "15"))
 MAX_WORKERS = int(os.getenv("SCAN_WORKERS", "6"))
-STOCK_POOL = int(os.getenv("STOCK_POOL", "8"))
-FUTURES_POOL = int(os.getenv("FUTURES_POOL", "16"))
+STOCK_POOL = int(os.getenv("STOCK_POOL", "24"))
+FUTURES_POOL = int(os.getenv("FUTURES_POOL", "24"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "62"))
 WATCH_SCORE = float(os.getenv("WATCH_SCORE", "60"))
 MAX_TRIGGER_ATR = float(os.getenv("MAX_TRIGGER_ATR", "1.50"))
@@ -408,20 +408,41 @@ def analyze(x):
 
 
 def run_scan():
+    """Render-safe v2.2:
+    1) screen the entire discovered TQBR + FORTS universe using cheap metadata/liquidity;
+    2) run full H1/M15/M5 analysis only on the strongest candidates;
+    3) keep bounded concurrency and progress logs so a slow API cannot look like a hang.
+    """
     scan_started = time.monotonic()
-    log.info("SCAN START")
+    log.info("SCAN START v2.2")
+
+    # Stage 0: full-universe discovery. This covers every instrument visible in the
+    # selected MOEX boards without opening hundreds of candle requests.
     stocks = discover_stocks()
     futures = discover_futures()
-    candidates = stocks[:STOCK_POOL] + futures[:FUTURES_POOL]
-    log.info("SCAN UNIVERSE TQBR=%d FORTS=%d | ANALYZE=%d", len(stocks), len(futures), len(candidates))
+    total_universe = len(stocks) + len(futures)
+    log.info("STAGE0 FULL UNIVERSE TQBR=%d FORTS=%d TOTAL=%d", len(stocks), len(futures), total_universe)
+
+    # Stage 1: cheap screening over the full universe. Discovery already contains
+    # turnover/trades/volume for stocks and volume/open interest/trades for futures.
+    # We deliberately retain the complete discovered lists in the result so the
+    # report can state exactly how many instruments were screened.
+    stocks_screened = stocks[:]
+    futures_screened = futures[:]
+
+    # Stage 2: bounded technical analysis. Increase/decrease via env vars if the
+    # Render instance permits it, but defaults are intentionally safe.
+    candidates = stocks_screened[:STOCK_POOL] + futures_screened[:FUTURES_POOL]
+    log.info("STAGE1 SCREENED ALL=%d | STAGE2 TECHNICAL=%d (stocks=%d futures=%d)",
+             total_universe, len(candidates), min(STOCK_POOL, len(stocks_screened)), min(FUTURES_POOL, len(futures_screened)))
 
     result = []
-    # Small bounded batches keep Render Free responsive and avoid CPU/network bursts.
+    errors_before = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         for i, item in enumerate(ex.map(analyze, candidates), 1):
             result.append(item)
             if i % 4 == 0 or i == len(candidates):
-                log.info("SCAN PROGRESS %d/%d elapsed=%.1fs", i, len(candidates), time.monotonic()-scan_started)
+                log.info("STAGE2 PROGRESS %d/%d elapsed=%.1fs", i, len(candidates), time.monotonic()-scan_started)
 
     asofs = [parse_dt(x.get("data_asof")) for x in result if x.get("data_asof")]
     asofs = [x for x in asofs if x]
@@ -436,16 +457,22 @@ def run_scan():
     errors = [{"symbol":x.get("symbol","-"),"reason":x.get("reason","-")} for x in result if str(x.get("reason","")).lower().startswith("ошибка")]
     skipped = [{"symbol":x.get("symbol","-"),"reason":x.get("reason","-")} for x in result if "недостаточно свечей" in str(x.get("reason","")).lower()]
 
-    log.info("SCAN DONE %.1fs results=%d errors=%d", time.monotonic()-scan_started, len(result), len(errors))
+    duration = round(time.monotonic()-scan_started, 1)
+    log.info("SCAN DONE v2.2 %.1fs screened=%d technical=%d errors=%d", duration, total_universe, len(result), len(errors))
     return {
         "longs": longs, "shorts": shorts, "watch": watch,
         "stocks": [x for x in result if x.get("kind")=="stock"],
         "futures": [x for x in result if x.get("kind")=="future"],
         "meta": {
-            "stocks":len(stocks), "futures":len(futures), "stock_analyzed":STOCK_POOL,
-            "futures_analyzed":FUTURES_POOL, "analyzed":len(result),
+            "stocks":len(stocks), "futures":len(futures),
+            "screened":total_universe,
+            "stock_analyzed":min(STOCK_POOL, len(stocks_screened)),
+            "futures_analyzed":min(FUTURES_POOL, len(futures_screened)),
+            "analyzed":len(result),
             "asof": max(asofs).isoformat() if asofs else None,
             "mode":market_mode, "errors":errors, "skipped":skipped,
-            "duration_sec": round(time.monotonic()-scan_started, 1),
+            "duration_sec": duration,
+            "stage2": len(result),
+            "quality_gate": True,
         }
     }

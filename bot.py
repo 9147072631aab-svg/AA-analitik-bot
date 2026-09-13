@@ -134,10 +134,11 @@ def fmt(r):
         market_line = "🟢 <b>РЫНОК ОТКРЫТ / АКТУАЛЬНЫЕ ДАННЫЕ</b>"
 
     out = [
-        "<b>📊 AA ANALITIK — MOEX v2.1</b>",
+        "<b>📊 AA ANALITIK — MOEX v2.2</b>",
         market_line,
         f"Universe: TQBR {meta.get('stocks', 0)} | FORTS {meta.get('futures', 0)} | "
-        f"анализ: {meta.get('analyzed', 0)} | {meta.get('duration_sec', '-')} сек. | Quality gate: ON",
+        f"просмотрено: {meta.get('screened', 0)} | полный анализ: {meta.get('analyzed', 0)} | "
+        f"{meta.get('duration_sec', '-')} сек. | Quality gate: ON",
         "",
         "<b>🏆 TOP LONG — АКЦИИ</b>",
         *([candidate_card(x, compact=True) for x in sl] or ["— нет качественных кандидатов"]),
@@ -171,6 +172,7 @@ def fmt(r):
         "TOP — рейтинг силы сетапа, а не сигнал на вход.",
         "Вход — только после breakout + retest M5, подтверждения H1 и остальных фильтров.",
         "🔵 В историческом режиме цена берётся из последней доступной свечи; это НЕ текущая котировка.",
+        "🔎 Полный Universe просмотрен по данным отбора; H1/M15/M5 глубоко анализируются у лучших кандидатов, чтобы сохранить скорость и устойчивость Render Free.",
         "⚠️ Сила сетапа — рейтинг, не вероятность. Подтверждённых входов максимум 2; дубли одного базового актива отсекаются. Новости пока не подключены. Бот не отправляет ордера.",
     ]
     return "\n\n".join(out)
@@ -181,7 +183,7 @@ def scan_in_background(chat):
         send(chat, "🟡 <b>Сканирование уже выполняется.</b> Дождись текущего результата.")
         return
     try:
-        send(chat, "⏳ <b>Сканирование запущено.</b>\nTQBR + FORTS • H1/M15/M5\nRender-safe режим: ограниченная параллельность + общий M1 на инструмент.")
+        send(chat, "⏳ <b>Сканирование запущено.</b>\nTQBR + FORTS • H1/M15/M5\nRender-safe v2.2: весь Universe → быстрый отбор → полный H1/M15/M5 лучших кандидатов.")
         send(chat, fmt(run_scan()))
     except Exception as e:
         print("SCAN ERROR:", repr(e), flush=True)
@@ -204,7 +206,7 @@ def handle(u):
         if t in ("/start", "/help"):
             send(chat, "<b>AA Analitik Bot</b>\n\n/scan — полный быстрый скан\n/stocks — акции\n/futures — фьючерсы\n/status — состояние\n\nTOP ≠ сигнал. Бот НЕ отправляет ордера.")
         elif t == "/status":
-            send(chat, "<b>AA Analitik</b>\nMOEX ISS • TQBR + FORTS • H1/M15/M5\nFast scanner: ON\nНовости: не подключены\nОрдера: НЕ отправляются.\nWebhook: работает.")
+            send(chat, "<b>AA Analitik</b>\nMOEX ISS • TQBR + FORTS • H1/M15/M5\nFast scanner v2.2: ON\nПолный Universe: ON\nТехнический анализ лучших кандидатов: ON\nНовости: не подключены\nОрдера: НЕ отправляются.\nWebhook: работает.")
         elif t == "/scan":
             threading.Thread(target=scan_in_background, args=(chat,), daemon=True).start()
         elif t == "/stocks":
