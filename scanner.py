@@ -313,9 +313,24 @@ def analyze(x):
         trigger_dist = long_dist if side == "LONG" else short_dist
         range_pos = long_range if side == "LONG" else short_range
 
-        crossed = any(z["close"] > trigger for z in f[-10:-1]) if side == "LONG" else any(z["close"] < trigger for z in f[-10:-1])
-        retest = (any(z["low"] <= trigger + a*0.15 and z["close"] > trigger for z in f[-4:]) if side == "LONG"
-                  else any(z["high"] >= trigger - a*0.15 and z["close"] < trigger for z in f[-4:]))
+        # Breakout must precede retest; the old logic could count the same/earlier candle twice.
+        recent = f[-12:]
+        breakout_idx = None
+        for i, z in enumerate(recent[:-2]):
+            if side == "LONG" and z["close"] > trigger:
+                breakout_idx = i
+            elif side == "SHORT" and z["close"] < trigger:
+                breakout_idx = i
+        crossed = breakout_idx is not None
+        retest = False
+        if breakout_idx is not None:
+            for z in recent[breakout_idx + 1:]:
+                if side == "LONG" and z["low"] <= trigger + a*0.15 and z["close"] >= trigger:
+                    retest = True
+                    break
+                if side == "SHORT" and z["high"] >= trigger - a*0.15 and z["close"] <= trigger:
+                    retest = True
+                    break
 
         hard = []
         if trigger_dist > MAX_TRIGGER_ATR:
@@ -354,9 +369,19 @@ def analyze(x):
             slv = max(res, entry + a*0.45); risk = max(slv-entry, MIN_PRICE)
             t1, t2, t3 = entry-risk*1.5, entry-risk*2.2, entry-risk*3
 
-        status = side if sc >= MIN_SCORE and not hard else "WAIT"
+        score_gap = abs(sl_score - ss_score)
+        # Confirmation is strict: score alone is never an entry signal.
+        confirm_ok = (
+            sc >= MIN_SCORE
+            and not hard
+            and crossed
+            and retest
+            and score_gap >= 6.0
+            and trigger_dist <= MAX_TRIGGER_ATR
+        )
+        status = side if confirm_ok else "WAIT"
         return {
-            **x, "status": status, "score": sc, "long_score": sl_score, "short_score": ss_score,
+            **x, "price": price, "status": status, "score": sc, "long_score": sl_score, "short_score": ss_score,
             "side": side, "regime": "TREND UP" if hs == "UP" else "TREND DOWN" if hs == "DOWN" else "RANGE",
             "h1": hs, "m15": ms, "m5": fs,
             "data_asof": f[-1].get("begin") or m[-1].get("begin") or h[-1].get("begin"),
@@ -364,6 +389,8 @@ def analyze(x):
             "sl": slv, "tp1": t1, "tp2": t2, "tp3": t3, "rr": 3,
             "volume_ratio": round(vr,2), "liquidity": "OK" if x.get("liq",0) > 10 else "CAUTION",
             "watch": sc >= WATCH_SCORE and bool(hard) and trigger_dist <= MAX_WATCH_TRIGGER_ATR,
+            "score_gap": round(score_gap, 1),
+            "root_key": x.get("root") or x.get("symbol", ""),
             "setup_phase": setup_phase, "trigger_distance_atr": round(trigger_dist,2),
             "trigger_condition": f"{side}: пробой и ретест {trigger:.6g}",
             "reason": "; ".join(hard) if hard else "подтверждённый сетап",
@@ -402,7 +429,7 @@ def run_scan():
             "stocks":len(stocks), "futures":len(futures), "stock_pool":STOCK_POOL, "futures_pool":FUTURES_POOL,
             "workers":MAX_WORKERS, "m1_days":M1_DAYS, "h1_days":H1_DAYS,
             "generated":datetime.now(timezone.utc).isoformat(), "market_mode":market_mode,
-            "analysis_asof":max(asofs).isoformat() if asofs else None, "history_mode":True,
+            "analysis_asof":max(asofs).isoformat() if asofs else None, "history_mode":True, "scanner_version":"2.0",
             "analysis_errors":errors, "technical_skipped":skipped,
         }
     }

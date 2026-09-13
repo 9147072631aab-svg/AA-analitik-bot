@@ -78,7 +78,7 @@ def candidate_card(x, compact=False):
 
     lines = [
         f"{icon} <b>{html.escape(str(x.get('symbol')))} — {label}</b>",
-        f"Score: <b>{f(x.get('score'), 1)}/100</b> | {x.get('regime', '-')}",
+        f"Сила сетапа: <b>{f(x.get('score'), 1)}/100</b> | {x.get('regime', '-')}",
         f"Цена: <b>{f(x.get('price'))}</b> | H1 {x.get('h1', '-')} / M15 {x.get('m15', '-')} / M5 {x.get('m5', '-')}",
     ]
     if status in ("LONG", "SHORT"):
@@ -134,9 +134,9 @@ def fmt(r):
         market_line = "🟢 <b>РЫНОК ОТКРЫТ / АКТУАЛЬНЫЕ ДАННЫЕ</b>"
 
     out = [
-        "<b>📊 AA ANALITIK — MOEX</b>",
+        "<b>📊 AA ANALITIK — MOEX v2.0</b>",
         market_line,
-        f"Universe: TQBR {meta.get('stocks', 0)} | FORTS {meta.get('futures', 0)}",
+        f"Universe: TQBR {meta.get('stocks', 0)} | FORTS {meta.get('futures', 0)} | Quality gate: ON",
         "",
         "<b>🏆 TOP LONG — АКЦИИ</b>",
         *([candidate_card(x, compact=True) for x in sl] or ["— нет качественных кандидатов"]),
@@ -150,7 +150,7 @@ def fmt(r):
         "<b>🏆 TOP SHORT — ФЬЮЧЕРСЫ</b>",
         *([candidate_card(x, compact=True) for x in fs] or ["— нет качественных кандидатов"]),
         "",
-        "<b>🔥 ГОТОВЫЕ ВХОДЫ</b>",
+        "<b>🔥 ГОТОВЫЕ ВХОДЫ — МАКС. 2</b>",
     ]
     out += [candidate_card(x) for x in confirmed] or ["Нет подтверждённых входов. Ждём breakout + retest M5; в середине диапазона не входим."]
 
@@ -167,10 +167,10 @@ def fmt(r):
     out += [
         "",
         "<b>ℹ️ ВАЖНО</b>",
-        "TOP — рейтинг кандидатов, а не сигнал на вход.",
+        "TOP — рейтинг силы сетапа, а не сигнал на вход.",
         "Вход — только после breakout + retest M5, подтверждения H1 и остальных фильтров.",
         "🔵 В историческом режиме цена берётся из последней доступной свечи; это НЕ текущая котировка.",
-        "⚠️ Score — рейтинг, не вероятность. Новости пока не подключены. Бот не отправляет ордера.",
+        "⚠️ Сила сетапа — рейтинг, не вероятность. Подтверждённых входов максимум 2; дубли одного базового актива отсекаются. Новости пока не подключены. Бот не отправляет ордера.",
     ]
     return "\n\n".join(out)
 
