@@ -288,18 +288,18 @@ def discover():
 def analyze(root, contract):
     secid = contract["secid"]
 
-    h1 = candles(secid, 60, minimum=80)
-    m15 = candles(secid, 15, minimum=80)
-    m5 = candles(secid, 5, minimum=80)
+    h1 = candles(secid, 60, minimum=60)
+    m15 = candles(secid, 15, minimum=55)
+    m5 = candles(secid, 5, minimum=100)
 
-    if min(len(h1), len(m15), len(m5)) < 80:
+    if len(h1) < 60 or len(m15) < 55 or len(m5) < 100:
         return {
             "symbol": contract["name"],
             "status": "WAIT",
             "rating": 0,
             "reason": (
-                f"Недостаточно данных: H1={len(h1)}, "
-                f"M15={len(m15)}, M5={len(m5)}."
+                f"Недостаточно данных: H1={len(h1)} (нужно 60), "
+                f"M15={len(m15)} (нужно 55), M5={len(m5)} (нужно 100)."
             ),
         }
 
