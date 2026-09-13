@@ -8,6 +8,12 @@ from datetime import datetime, timezone, timedelta
 BASE = "https://iss.moex.com/iss"
 TIMEOUT = int(os.getenv("MOEX_TIMEOUT", "20"))
 STAGE2 = int(os.getenv("STAGE2", "8"))
+# Analyze a wider pool than the TOP size. The most liquid FORTS contracts can
+# be newly listed/illiquid and have too little intraday history. If we analyze
+# only the first 8, all futures can disappear from TOP even when deeper
+# contracts have enough history. TOP itself is still limited to 3 in bot.py.
+STOCK_POOL = int(os.getenv("STOCK_POOL", "16"))
+FUTURES_POOL = int(os.getenv("FUTURES_POOL", "40"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "62"))
 
 s = requests.Session()
@@ -532,9 +538,12 @@ def run_scan():
     stocks = discover_stocks()
     futures = discover_futures()
 
+    # STAGE2 controls TOP size/quality, but the analysis pool must be wider.
+    # This prevents technically unusable front contracts from consuming the
+    # entire futures quota.
     candidates = (
-        stocks[:STAGE2]
-        + futures[:STAGE2]
+        stocks[:STOCK_POOL]
+        + futures[:FUTURES_POOL]
     )
 
     with ThreadPoolExecutor(max_workers=8) as ex:
@@ -566,6 +575,8 @@ def run_scan():
             "stocks": len(stocks),
             "futures": len(futures),
             "stage2": STAGE2,
+            "stock_pool": STOCK_POOL,
+            "futures_pool": FUTURES_POOL,
             "generated": datetime.now(timezone.utc).isoformat(),
         },
     }
