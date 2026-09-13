@@ -53,22 +53,52 @@ def candidate_card(x):
     ])
 
 
+def is_technical_wait(x):
+    reason = str(x.get("reason", "")).lower()
+    return (
+        "недостаточно свечей" in reason
+        or reason.startswith("ошибка:")
+        or reason.startswith("ошибка")
+    )
+
+
 def top_by_side(items, side, limit=3):
+    # TOP is a trading watchlist, not a dump of technically unusable rows.
+    # Keep WAIT candidates that have a real directional side, but exclude
+    # rows that could not be analysed because history/data was insufficient.
+    pool = [
+        x for x in items
+        if x.get("side") == side and not is_technical_wait(x)
+    ]
     return sorted(
-        [x for x in items if x.get("side") == side],
+        pool,
         key=lambda x: float(x.get("score") or 0),
         reverse=True,
     )[:limit]
-
-
-def top_any(items, limit=3):
-    return sorted(items, key=lambda x: float(x.get("score") or 0), reverse=True)[:limit]
 
 
 def section(title, items):
     out = [f"<b>{title}</b>"]
     out += [candidate_card(x) for x in items] or ["— кандидатов нет"]
     return "\n\n".join(out)
+
+
+def technical_summary(items):
+    technical = [x for x in items if is_technical_wait(x)]
+    if not technical:
+        return ""
+    insufficient = [
+        x for x in technical
+        if "недостаточно свечей" in str(x.get("reason", "")).lower()
+    ]
+    errors = len(technical) - len(insufficient)
+    parts = [f"⚪ Технически пропущено: {len(technical)}"]
+    if insufficient:
+        names = ", ".join(str(x.get("symbol", "-")) for x in insufficient[:8])
+        parts.append(f"нет достаточной истории: {names}")
+    if errors:
+        parts.append(f"ошибки анализа: {errors}")
+    return "\n".join(parts)
 
 
 def fmt(r):
@@ -80,10 +110,6 @@ def fmt(r):
     stock_short = top_by_side(stocks, "SHORT")
     future_long = top_by_side(futures, "LONG")
     future_short = top_by_side(futures, "SHORT")
-
-    # Fallback for old scanner results without side: futures stay visible.
-    if not future_long and not future_short and futures:
-        future_long = top_any(futures, 3)
 
     confirmed = sorted(
         [x for x in allc if x.get("status") in ("LONG", "SHORT")],
@@ -105,16 +131,23 @@ def fmt(r):
         "",
         "<b>🔥 ПОДТВЕРЖДЁННЫЕ ВХОДЫ</b>",
     ]
-    out += [card(x, wait=False) for x in confirmed] or ["Пока нет подтверждённого breakout + retest. Ждём триггер; в середине диапазона не входим."]
+    out += [card(x, wait=False) for x in confirmed] or [
+        "Пока нет подтверждённого breakout + retest. Ждём триггер; в середине диапазона не входим."
+    ]
+
+    tech = technical_summary(allc)
+    if tech:
+        out += ["", tech]
+
     out += [
         "",
         "<b>ℹ️ TOP ≠ сигнал на вход</b>",
-        "TOP показывает лучшие кандидаты отдельно по акциям и фьючерсам. Вход — только после выполнения условий WAIT.",
+        "TOP показывает лучшие анализируемые LONG/SHORT-кандидаты отдельно по акциям и фьючерсам. Технически неанализируемые инструменты в TOP не попадают.",
+        "Вход — только после выполнения условий breakout + retest и остальных фильтров.",
         "",
         "⚠️ Score — рейтинг, не вероятность. Новости пока не подключены. Бот не отправляет ордера.",
     ]
     return "\n\n".join(out)
-
 
 def scan_in_background(chat):
     try:

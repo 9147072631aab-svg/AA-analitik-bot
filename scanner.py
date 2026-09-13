@@ -134,9 +134,13 @@ def fetch_candles(sec, kind, interval, days):
                 "begin": x.get("begin"),
             })
 
-        if len(data) < 500:
-            break
+        # ISS may return relatively small pages (for example 20/100 rows).
+        # Do not treat a short page as the end of history; advance pagination
+        # until the endpoint returns an empty page or we reach the safety cap.
+        prev_start = start
         start += len(data)
+        if start <= prev_start:
+            break
 
     uniq = {}
     for x in out:
