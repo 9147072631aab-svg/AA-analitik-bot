@@ -1,0 +1,20 @@
+name: AA Analitik Auto Scan
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger AA Analitik
+        env:
+          AA_AUTO_SCAN_TOKEN: ${{ secrets.AA_AUTO_SCAN_TOKEN }}
+        run: |
+          curl --fail-with-body \
+            -X POST \
+            -H "X-AA-AUTO-SCAN-TOKEN: ${AA_AUTO_SCAN_TOKEN}" \
+            "https://aa-analitik-bot.onrender.com/auto-scan"
