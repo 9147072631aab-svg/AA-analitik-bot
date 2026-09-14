@@ -7,7 +7,7 @@ from datetime import date
 import requests
 from flask import Flask, request, Response, render_template_string
 
-from bot import handle, run_scan_job
+from bot import handle, enqueue_scan
 from moex_downloader import fetch
 
 app = Flask(__name__)
@@ -44,10 +44,6 @@ def set_webhook():
     return result
 
 
-# -------------------------------------------------
-# TELEGRAM
-# -------------------------------------------------
-
 @app.post(WEBHOOK_PATH)
 def telegram():
     update = request.get_json(silent=True) or {}
@@ -78,10 +74,6 @@ def telegram_status():
     return result, 500
 
 
-# -------------------------------------------------
-# MAIN
-# -------------------------------------------------
-
 @app.get("/")
 def home():
     return {
@@ -98,10 +90,6 @@ def health():
     return {"ok": True}, 200
 
 
-# -------------------------------------------------
-# AUTO SCAN
-# -------------------------------------------------
-
 @app.post("/auto-scan")
 def auto_scan():
     supplied = request.headers.get("X-AA-AUTO-SCAN-TOKEN", "").strip()
@@ -110,37 +98,24 @@ def auto_scan():
         return {"ok": False, "error": "unauthorized"}, 401
 
     try:
-        print("AUTO SCAN START", flush=True)
+        print("AUTO SCAN REQUEST ACCEPTED", flush=True)
 
-        result, events = run_scan_job(
-            chat=None,
-            notify_events=False,
-        )
+        if not enqueue_scan(None):
+            print("AUTO SCAN QUEUE FULL", flush=True)
+            return {"ok": False, "error": "scan already queued"}, 409
 
-        meta = result.get("meta", {})
-
-        print(
-            f"AUTO SCAN FINISHED events={len(events)} "
-            f"screened={meta.get('screened', 0)} "
-            f"analyzed={meta.get('analyzed', 0)}",
-            flush=True,
-        )
+        print("AUTO SCAN QUEUED", flush=True)
 
         return {
             "ok": True,
-            "events": len(events),
-            "screened": meta.get("screened", 0),
-            "analyzed": meta.get("analyzed", 0),
-        }, 200
+            "queued": True,
+            "message": "scan queued",
+        }, 202
 
     except Exception as e:
         print("AUTO SCAN ERROR:", repr(e), flush=True)
         return {"ok": False, "error": str(e)[:1000]}, 500
 
-
-# -------------------------------------------------
-# MOEX DOWNLOADER
-# -------------------------------------------------
 
 MOEX_HTML = """
 <!doctype html>
@@ -307,10 +282,6 @@ def moex_download():
         },
     )
 
-
-# -------------------------------------------------
-# WEBHOOK STARTUP
-# -------------------------------------------------
 
 threading.Thread(
     target=set_webhook,

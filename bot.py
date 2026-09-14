@@ -3,7 +3,6 @@ import html
 import queue
 import threading
 import traceback
-from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
@@ -16,10 +15,12 @@ MSK = ZoneInfo("Europe/Moscow")
 
 SCAN_QUEUE = queue.Queue(maxsize=2)
 SCAN_LOCK = threading.Lock()
-LAST_EVENT_IDS = set()
 
 
 def send(chat, text):
+    if not chat:
+        return
+
     text = str(text or "")
     limit = 3800
     chunks = []
@@ -34,6 +35,7 @@ def send(chat, text):
             cut = limit
         chunks.append(text[:cut])
         text = text[cut:].lstrip("\n")
+
     for chunk in chunks or [""]:
         r = requests.post(
             f"{API}/sendMessage",
@@ -54,13 +56,17 @@ def candidate_card(x):
     side = x.get("side", "WAIT")
     status = x.get("status", "WAIT")
     icon = "🔥" if status in ("LONG", "SHORT") else ("🟡" if x.get("watch") else "⚪")
-    label = f"{side} — ВХОД ГОТОВ" if status in ("LONG","SHORT") else (f"{side} — НАБЛЮДЕНИЕ" if x.get("watch") else "WAIT")
+    label = (
+        f"{side} — ВХОД ГОТОВ"
+        if status in ("LONG", "SHORT")
+        else (f"{side} — НАБЛЮДЕНИЕ" if x.get("watch") else "WAIT")
+    )
     lines = [
         f"{icon} <b>{html.escape(str(x.get('symbol')))} — {label}</b>",
         f"Score: <b>{f(x.get('score'),1)}/100</b> | Цена: <b>{f(x.get('price'))}</b>",
         f"H1 {html.escape(str(x.get('h1','-')))} / M15 {html.escape(str(x.get('m15','-')))} / M5 {html.escape(str(x.get('m5','-')))}",
     ]
-    if status in ("LONG","SHORT"):
+    if status in ("LONG", "SHORT"):
         lines += [
             f"Entry <b>{f(x.get('entry'))}</b> | Trigger {f(x.get('trigger'))}",
             f"SL <b>{f(x.get('sl'))}</b> | TP1 {f(x.get('tp1'))} | TP2 {f(x.get('tp2'))} | TP3 {f(x.get('tp3'))}",
@@ -84,7 +90,8 @@ def format_scan(result):
     def top(items, side):
         return sorted(
             [x for x in items if x.get("side")==side and (x.get("watch") or x.get("status")==side)],
-            key=lambda x: float(x.get("score") or 0), reverse=True
+            key=lambda x: float(x.get("score") or 0),
+            reverse=True
         )[:3]
 
     out = [
@@ -129,22 +136,40 @@ def run_scan_job(chat=None, notify_events=True):
     return result, events
 
 
+def enqueue_scan(chat=None):
+    try:
+        SCAN_QUEUE.put_nowait(chat)
+        print(f"SCAN QUEUED chat={chat}", flush=True)
+        return True
+    except queue.Full:
+        print("SCAN QUEUE FULL", flush=True)
+        return False
+
+
 def scan_worker():
     print("SCAN WORKER STARTED", flush=True)
     while True:
         chat = SCAN_QUEUE.get()
         try:
             print(f"SCAN START chat={chat}", flush=True)
-            send(chat, "🔎 <b>Сканирование запущено</b>\nРезультат будет отправлен только один раз.")
-            run_scan_job(chat=chat, notify_events=True)
+
+            if chat:
+                send(chat, "🔎 <b>Сканирование запущено</b>\nРезультат будет отправлен только один раз.")
+
+            run_scan_job(
+                chat=chat,
+                notify_events=bool(chat),
+            )
             print("SCAN FINISHED", flush=True)
+
         except Exception as exc:
             print("SCAN WORKER ERROR:", repr(exc), flush=True)
             traceback.print_exc()
-            try:
-                send(chat, "❌ <b>Ошибка сканирования</b>\n" + html.escape(str(exc))[:1500])
-            except Exception:
-                pass
+            if chat:
+                try:
+                    send(chat, "❌ <b>Ошибка сканирования</b>\n" + html.escape(str(exc))[:1500])
+                except Exception:
+                    pass
         finally:
             SCAN_QUEUE.task_done()
 
@@ -172,10 +197,9 @@ def handle(update):
             ar = "-" if s["avg_r"] is None else f"{s['avg_r']:+.2f}R"
             send(chat, f"<b>🧠 AA ANALITIK — ЖУРНАЛ</b>\nНаблюдений: {s['observations']}\nПодтверждённых сценариев: {s['ready']}\nЗавершено: {s['closed']}\nУспешных: {s['wins']}\nWin Rate: {wr}\nСредний результат: {ar}")
         elif command in ("/scan","scan","скан"):
-            try:
-                SCAN_QUEUE.put_nowait(chat)
+            if enqueue_scan(chat):
                 send(chat, "🟡 <b>Скан поставлен в очередь.</b>")
-            except queue.Full:
+            else:
                 send(chat, "🟠 <b>Сканирование уже выполняется.</b>")
         else:
             send(chat, "Используй /scan, «скан», /status или /report.")
