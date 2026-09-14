@@ -1,4 +1,3 @@
-import json
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -12,39 +11,41 @@ CACHE_TTL = int(__import__("os").getenv("MOEX_CALENDAR_CACHE_TTL", "21600"))
 
 _cache = {}
 _session = requests.Session()
-_session.headers.update({"User-Agent": "AA-Analitik/Calendar/1.0"})
+_session.headers.update({"User-Agent": "AA-Analitik/Calendar/1.1"})
 
 
 def _fetch(kind, year):
-    # MOEX official machine-readable trading calendar.
-    # is_traded=0: non-trading day / holiday
-    # is_traded=1: trading day, including weekend sessions and transferred workdays.
-    url = f"{BASE}/calendars/{kind}.json"
-    params = {
-        "show_all_days": 1,
-        "iss.only": "off_days",
-        "start": 0,
-    }
-    r = _session.get(url, params=params, timeout=TIMEOUT)
-    r.raise_for_status()
-    payload = r.json()
-    block = payload.get("off_days", {})
-    columns = block.get("columns", [])
-    data = block.get("data", [])
-    rows = [dict(zip(columns, row)) for row in data]
+    """Fetch the official MOEX machine-readable calendar."""
+    params = {"show_all_days": 1, "iss.only": "off_days", "start": 0}
+    last_error = None
 
-    result = {}
-    for row in rows:
-        d = str(row.get("tradedate") or "")[:10]
-        if not d.startswith(str(year)):
-            continue
-        value = row.get("is_traded")
-        result[d] = {
-            "is_traded": None if value in (None, "") else int(value),
-            "reason": row.get("reason"),
-            "trade_session_date": row.get("trade_session_date"),
-        }
-    return result
+    for scheme in ("https", "http"):
+        url = f"{scheme}://iss.moex.com/iss/calendars/{kind}"
+        try:
+            r = _session.get(url, params=params, timeout=TIMEOUT)
+            r.raise_for_status()
+            payload = r.json()
+            block = payload.get("off_days", {})
+            columns = block.get("columns", [])
+            data = block.get("data", [])
+            rows = [dict(zip(columns, row)) for row in data]
+
+            result = {}
+            for row in rows:
+                d = str(row.get("tradedate") or "")[:10]
+                if not d.startswith(str(year)):
+                    continue
+                value = row.get("is_traded")
+                result[d] = {
+                    "is_traded": None if value in (None, "") else int(value),
+                    "reason": row.get("reason"),
+                    "trade_session_date": row.get("trade_session_date"),
+                }
+            return result
+        except Exception as exc:
+            last_error = exc
+
+    raise RuntimeError(f"MOEX calendar unavailable: {last_error}")
 
 
 def calendar(kind, year=None):
@@ -61,47 +62,67 @@ def calendar(kind, year=None):
 
 
 def market_day(kind, when=None):
-    when = when or datetime.now(MSK)
-    d = when.astimezone(MSK).date().isoformat()
+    when = (when or datetime.now(MSK)).astimezone(MSK)
+    d = when.date().isoformat()
+
     try:
         row = calendar(kind, when.year).get(d)
         if row is None:
-            # Conservative fallback: Mon-Fri only when MOEX does not return a row.
             return {
-                "open": when.weekday() < 5,
+                "open": False,
+                "known": False,
                 "date": d,
-                "reason": "fallback_weekday",
-                "source": "fallback",
+                "reason": "calendar_missing_date",
+                "source": "MOEX ISS",
             }
+
+        is_traded = row.get("is_traded")
+        if is_traded is None:
+            return {
+                "open": False,
+                "known": False,
+                "date": d,
+                "reason": "calendar_unknown",
+                "trade_session_date": row.get("trade_session_date"),
+                "source": "MOEX ISS",
+            }
+
         return {
-            "open": row["is_traded"] == 1,
+            "open": is_traded == 1,
+            "known": True,
             "date": d,
             "reason": row.get("reason") or "N",
             "trade_session_date": row.get("trade_session_date"),
             "source": "MOEX ISS",
         }
     except Exception as exc:
-        # Fail safe: never invent a holiday, but do not block ordinary weekdays
-        # if the public calendar endpoint is temporarily unavailable.
+        # Fail closed: calendar failure must never become a false OPEN state.
         return {
-            "open": when.weekday() < 5,
+            "open": False,
+            "known": False,
             "date": d,
             "reason": "calendar_error",
-            "source": "fallback",
+            "source": "MOEX ISS unavailable",
             "error": str(exc)[:300],
         }
 
 
 def markets_status(when=None):
-    when = when or datetime.now(MSK)
+    when = (when or datetime.now(MSK)).astimezone(MSK)
     stock = market_day("stock", when)
     futures = market_day("futures", when)
+    calendar_ok = bool(stock.get("known") and futures.get("known"))
+    full_scan_allowed = bool(
+        calendar_ok and stock.get("open") and futures.get("open")
+    )
+
     return {
-        "date": when.astimezone(MSK).date().isoformat(),
-        "time_msk": when.astimezone(MSK).strftime("%H:%M:%S"),
+        "date": when.date().isoformat(),
+        "time_msk": when.strftime("%H:%M:%S"),
         "stock": stock,
         "futures": futures,
-        "full_scan_allowed": bool(stock["open"] and futures["open"]),
+        "calendar_ok": calendar_ok,
+        "full_scan_allowed": full_scan_allowed,
     }
 
 

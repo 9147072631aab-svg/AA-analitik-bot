@@ -75,7 +75,7 @@ def candidate_card(x):
         else (f"{side} — НАБЛЮДЕНИЕ" if x.get("watch") else "WAIT")
     )
     lines = [
-        f"{icon} <b>{html.escape(str(x.get('symbol')))} — {label}</b>",
+        f"🔎 <b>{html.escape(str(x.get('symbol')))} — {label}</b>",
         f"Score: <b>{f(x.get('score'),1)}/100</b> | Цена: <b>{f(x.get('price'))}</b>",
         f"H1 {html.escape(str(x.get('h1','-')))} / M15 {html.escape(str(x.get('m15','-')))} / M5 {html.escape(str(x.get('m5','-')))}",
     ]
@@ -134,19 +134,28 @@ def format_scan(result):
 
 def market_text():
     s = markets_status()
+
     def one(label, x):
-        if x["open"]:
-            extra = f" ({x.get('reason','N')})"
-            return f"🟢 {label}: <b>ОТКРЫТ</b>{extra}"
-        return f"🔴 {label}: <b>ЗАКРЫТ</b> ({x.get('reason','H')})"
+        if not x.get("known"):
+            return f"⚪ {label}: <b>НЕ УДАЛОСЬ ПРОВЕРИТЬ</b> ({html.escape(str(x.get('reason','calendar_error')))})"
+        if x.get("open"):
+            reason = x.get("reason", "N")
+            return f"🟢 {label}: <b>ОТКРЫТ</b> ({html.escape(str(reason))})"
+        return f"🔴 {label}: <b>ЗАКРЫТ</b> ({html.escape(str(x.get('reason','H')))})"
+
+    if not s.get("calendar_ok"):
+        decision = "🛑 <b>Полный скан ЗАПРЕЩЁН: календарь MOEX не подтверждён.</b>"
+    elif s["full_scan_allowed"]:
+        decision = "🟢 <b>Полный скан разрешён.</b>"
+    else:
+        decision = "⏸️ <b>Полный скан остановлен: один из рынков закрыт.</b>"
 
     return (
         "<b>🏦 MOEX — СТАТУС РЫНКА</b>\n"
         f"Дата: {s['date']} | {s['time_msk']}\n\n"
         f"{one('Фондовый', s['stock'])}\n"
         f"{one('Срочный', s['futures'])}\n\n"
-        + ("🟢 <b>Полный скан разрешён.</b>" if s["full_scan_allowed"]
-           else "⏸️ <b>Полный скан остановлен: один из рынков закрыт.</b>")
+        + decision
     )
 
 
@@ -174,13 +183,19 @@ def run_scan_job(chat=None, notify_events=True):
 
     market = markets_status()
     if not market["full_scan_allowed"]:
-        reason = (
-            f"рынок закрыт: stock={market['stock']['reason']}, "
-            f"futures={market['futures']['reason']}"
-        )
+        if not market.get("calendar_ok"):
+            reason = "календарь MOEX не подтверждён"
+            result_text = "SKIPPED — календарь MOEX не подтверждён"
+        else:
+            reason = (
+                f"рынок закрыт: stock={market['stock']['reason']}, "
+                f"futures={market['futures']['reason']}"
+            )
+            result_text = "SKIPPED — рынок закрыт"
+
         print(f"SCAN SKIPPED — {reason}", flush=True)
         with STATE_LOCK:
-            LAST_SCAN_RESULT = "SKIPPED — рынок закрыт"
+            LAST_SCAN_RESULT = result_text
             LAST_SCAN_FINISHED = now_msk()
 
         if chat:
@@ -233,10 +248,7 @@ def scan_worker():
             if chat:
                 send(chat, "🔎 <b>Сканирование запущено.</b>\nПроверяю торговый календарь MOEX…")
 
-            run_scan_job(
-                chat=chat,
-                notify_events=bool(chat),
-            )
+            run_scan_job(chat=chat, notify_events=bool(chat))
             print("SCAN FINISHED", flush=True)
 
         except Exception as exc:
@@ -283,6 +295,7 @@ def handle(update):
                  "/report — статистика журнала\n\n"
                  "Автоскан: каждые 15 минут.\n"
                  "Праздники и выходные проверяются по календарю MOEX.\n"
+                 "При недоступности календаря скан блокируется.\n"
                  "🤖 Ордера бот не отправляет.")
         elif command in ("/market", "/marketstatus", "рынок"):
             send(chat, market_text())
