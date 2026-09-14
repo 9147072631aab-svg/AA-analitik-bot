@@ -3,11 +3,13 @@ import html
 import queue
 import threading
 import traceback
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
 from scanner import run_scan
 from journal import save_scan, update_virtual_outcomes, daily_stats
+from market_calendar import markets_status
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 API = f"https://api.telegram.org/bot{TOKEN}"
@@ -15,6 +17,17 @@ MSK = ZoneInfo("Europe/Moscow")
 
 SCAN_QUEUE = queue.Queue(maxsize=2)
 SCAN_LOCK = threading.Lock()
+
+STATE_LOCK = threading.Lock()
+SCAN_RUNNING = False
+LAST_SCAN_STARTED = None
+LAST_SCAN_FINISHED = None
+LAST_SCAN_RESULT = None
+LAST_CHAT_ID = None
+
+
+def now_msk():
+    return datetime.now(MSK).strftime("%Y-%m-%d %H:%M:%S MSK")
 
 
 def send(chat, text):
@@ -119,12 +132,69 @@ def format_scan(result):
     return "\n".join(out)
 
 
+def market_text():
+    s = markets_status()
+    def one(label, x):
+        if x["open"]:
+            extra = f" ({x.get('reason','N')})"
+            return f"🟢 {label}: <b>ОТКРЫТ</b>{extra}"
+        return f"🔴 {label}: <b>ЗАКРЫТ</b> ({x.get('reason','H')})"
+
+    return (
+        "<b>🏦 MOEX — СТАТУС РЫНКА</b>\n"
+        f"Дата: {s['date']} | {s['time_msk']}\n\n"
+        f"{one('Фондовый', s['stock'])}\n"
+        f"{one('Срочный', s['futures'])}\n\n"
+        + ("🟢 <b>Полный скан разрешён.</b>" if s["full_scan_allowed"]
+           else "⏸️ <b>Полный скан остановлен: один из рынков закрыт.</b>")
+    )
+
+
+def scan_status_text():
+    with STATE_LOCK:
+        running = SCAN_RUNNING
+        started = LAST_SCAN_STARTED or "-"
+        finished = LAST_SCAN_FINISHED or "-"
+        result = LAST_SCAN_RESULT or "-"
+
+    q = SCAN_QUEUE.qsize()
+    return (
+        "<b>🔎 AA ANALITIK — СТАТУС СКАНА</b>\n"
+        f"Состояние: <b>{'ЗАПУЩЕН' if running else 'НЕ ЗАПУЩЕН'}</b>\n"
+        f"Очередь: <b>{q}</b>\n"
+        f"Последний запуск: {started}\n"
+        f"Последнее завершение: {finished}\n"
+        f"Последний результат: {html.escape(str(result))}\n"
+        f"Время проверки: {now_msk()}"
+    )
+
+
 def run_scan_job(chat=None, notify_events=True):
+    global LAST_SCAN_RESULT, LAST_SCAN_FINISHED
+
+    market = markets_status()
+    if not market["full_scan_allowed"]:
+        reason = (
+            f"рынок закрыт: stock={market['stock']['reason']}, "
+            f"futures={market['futures']['reason']}"
+        )
+        print(f"SCAN SKIPPED — {reason}", flush=True)
+        with STATE_LOCK:
+            LAST_SCAN_RESULT = "SKIPPED — рынок закрыт"
+            LAST_SCAN_FINISHED = now_msk()
+
+        if chat:
+            send(chat, "⏸️ <b>Сканирование не запускалось.</b>\n" + market_text())
+        return {"meta": {"skipped": True, "reason": reason}}, []
+
     with SCAN_LOCK:
         result = run_scan()
         update_virtual_outcomes(result)
         events = save_scan(result)
         print(f"JOURNAL SAVED events={len(events)}", flush=True)
+
+    with STATE_LOCK:
+        LAST_SCAN_RESULT = f"OK: analyzed={result.get('meta',{}).get('analyzed',0)}"
 
     if chat:
         send(chat, format_scan(result))
@@ -147,14 +217,21 @@ def enqueue_scan(chat=None):
 
 
 def scan_worker():
+    global SCAN_RUNNING, LAST_SCAN_STARTED, LAST_SCAN_FINISHED
+
     print("SCAN WORKER STARTED", flush=True)
     while True:
         chat = SCAN_QUEUE.get()
+        with STATE_LOCK:
+            SCAN_RUNNING = True
+            LAST_SCAN_STARTED = now_msk()
+            LAST_SCAN_FINISHED = None
+
         try:
             print(f"SCAN START chat={chat}", flush=True)
 
             if chat:
-                send(chat, "🔎 <b>Сканирование запущено</b>\nРезультат будет отправлен только один раз.")
+                send(chat, "🔎 <b>Сканирование запущено.</b>\nПроверяю торговый календарь MOEX…")
 
             run_scan_job(
                 chat=chat,
@@ -165,12 +242,18 @@ def scan_worker():
         except Exception as exc:
             print("SCAN WORKER ERROR:", repr(exc), flush=True)
             traceback.print_exc()
+            with STATE_LOCK:
+                LAST_SCAN_RESULT = f"ERROR: {str(exc)[:300]}"
             if chat:
                 try:
                     send(chat, "❌ <b>Ошибка сканирования</b>\n" + html.escape(str(exc))[:1500])
                 except Exception:
                     pass
         finally:
+            with STATE_LOCK:
+                SCAN_RUNNING = False
+                if not LAST_SCAN_FINISHED:
+                    LAST_SCAN_FINISHED = now_msk()
             SCAN_QUEUE.task_done()
 
 
@@ -178,6 +261,8 @@ threading.Thread(target=scan_worker, name="scan-worker", daemon=True).start()
 
 
 def handle(update):
+    global LAST_CHAT_ID
+
     print("TELEGRAM UPDATE RECEIVED", flush=True)
     message = update.get("message") or {}
     chat = (message.get("chat") or {}).get("id")
@@ -185,24 +270,61 @@ def handle(update):
     if not chat:
         return
 
+    LAST_CHAT_ID = chat
+
     try:
         if command in ("/start","/help"):
-            send(chat, "<b>AA Analitik v3.0</b>\n\n/scan или «скан» — полный скан\n/status — состояние\n/report — статистика журнала\n\nАвтоскан: каждые 15 минут.\nTelegram — только важные события.")
+            send(chat,
+                 "<b>AA Analitik v3.1</b>\n\n"
+                 "/scan или «скан» — запустить скан\n"
+                 "/scanstatus — статус текущего скана\n"
+                 "/market — состояние фондового/срочного рынка\n"
+                 "/status — состояние системы\n"
+                 "/report — статистика журнала\n\n"
+                 "Автоскан: каждые 15 минут.\n"
+                 "Праздники и выходные проверяются по календарю MOEX.\n"
+                 "🤖 Ордера бот не отправляет.")
+        elif command in ("/market", "/marketstatus", "рынок"):
+            send(chat, market_text())
+        elif command in ("/scanstatus", "/scan_status", "статус скана"):
+            send(chat, scan_status_text())
         elif command == "/status":
             stats = daily_stats()
-            send(chat, f"<b>AA Analitik v3.0</b>\nScanner v2.2: ON\nProtocol v1.3: ON\nАвтоскан: ON\nЖурнал наблюдений: ON\nНаблюдений: {stats['observations']}\nПодтверждённых сценариев: {stats['ready']}\n🤖 Ордера: НЕ отправляются.")
+            send(chat,
+                 f"<b>AA Analitik v3.1</b>\n"
+                 f"Scanner v2.2: ON\n"
+                 f"Protocol v1.3: ON\n"
+                 f"Автоскан: ON\n"
+                 f"MOEX calendar: ON\n"
+                 f"Журнал наблюдений: ON\n"
+                 f"Наблюдений: {stats['observations']}\n"
+                 f"Подтверждённых сценариев: {stats['ready']}\n"
+                 f"🤖 Ордера: НЕ отправляются.")
         elif command == "/report":
             s = daily_stats()
             wr = "-" if s["win_rate"] is None else f"{s['win_rate']:.1f}%"
             ar = "-" if s["avg_r"] is None else f"{s['avg_r']:+.2f}R"
-            send(chat, f"<b>🧠 AA ANALITIK — ЖУРНАЛ</b>\nНаблюдений: {s['observations']}\nПодтверждённых сценариев: {s['ready']}\nЗавершено: {s['closed']}\nУспешных: {s['wins']}\nWin Rate: {wr}\nСредний результат: {ar}")
+            send(chat,
+                 f"<b>🧠 AA ANALITIK — ЖУРНАЛ</b>\n"
+                 f"Наблюдений: {s['observations']}\n"
+                 f"Подтверждённых сценариев: {s['ready']}\n"
+                 f"Завершено: {s['closed']}\n"
+                 f"Успешных: {s['wins']}\n"
+                 f"Win Rate: {wr}\n"
+                 f"Средний результат: {ar}")
         elif command in ("/scan","scan","скан"):
             if enqueue_scan(chat):
-                send(chat, "🟡 <b>Скан поставлен в очередь.</b>")
+                send(chat, "🟡 <b>Скан поставлен в очередь.</b>\nПроверка рынка и запуск — в фоне.")
             else:
-                send(chat, "🟠 <b>Сканирование уже выполняется.</b>")
+                send(chat, "🟠 <b>Сканирование уже выполняется.</b>\nИспользуй /scanstatus.")
         else:
-            send(chat, "Используй /scan, «скан», /status или /report.")
+            send(chat,
+                 "Команды:\n"
+                 "/scan — запустить скан\n"
+                 "/scanstatus — статус сканирования\n"
+                 "/market — рынок открыт/закрыт\n"
+                 "/status — система\n"
+                 "/report — журнал")
     except Exception as exc:
         print("BOT ERROR:", repr(exc), flush=True)
         traceback.print_exc()

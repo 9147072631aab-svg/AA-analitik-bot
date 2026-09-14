@@ -7,8 +7,8 @@ from datetime import date
 import requests
 from flask import Flask, request, Response, render_template_string
 
+import bot
 from bot import handle, enqueue_scan
-from moex_downloader import fetch
 
 app = Flask(__name__)
 
@@ -79,6 +79,7 @@ def home():
     return {
         "ok": True,
         "service": "AA Analitik Bot",
+        "version": "3.1",
         "webhook_url": WEBHOOK_URL,
         "moex_downloader": "/moex",
         "auto_scan": "/auto-scan",
@@ -100,11 +101,16 @@ def auto_scan():
     try:
         print("AUTO SCAN REQUEST ACCEPTED", flush=True)
 
-        if not enqueue_scan(None):
+        # If the user has talked to the bot in this process, use that chat
+        # so the bot can visibly report start/skip/completion. Otherwise the
+        # scan still runs silently.
+        chat = bot.LAST_CHAT_ID
+
+        if not enqueue_scan(chat):
             print("AUTO SCAN QUEUE FULL", flush=True)
             return {"ok": False, "error": "scan already queued"}, 409
 
-        print("AUTO SCAN QUEUED", flush=True)
+        print(f"AUTO SCAN QUEUED chat={chat}", flush=True)
 
         return {
             "ok": True,
@@ -247,6 +253,8 @@ def moex_download():
             "w",
             zipfile.ZIP_DEFLATED
         ) as archive:
+
+            from moex_downloader import fetch
 
             for secid in secids:
                 print(
