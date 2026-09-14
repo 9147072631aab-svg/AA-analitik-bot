@@ -1,18 +1,22 @@
 import os
 import html
+import queue
 import threading
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
-
 from scanner import run_scan
+from journal import save_scan, update_virtual_outcomes, daily_stats
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 API = f"https://api.telegram.org/bot{TOKEN}"
-SCAN_LOCK = threading.Lock()
 MSK = ZoneInfo("Europe/Moscow")
+
+SCAN_QUEUE = queue.Queue(maxsize=2)
+SCAN_LOCK = threading.Lock()
+LAST_EVENT_IDS = set()
 
 
 def send(chat, text):
@@ -36,12 +40,7 @@ def send(chat, text):
             json={"chat_id": chat, "text": chunk, "parse_mode": "HTML"},
             timeout=30,
         )
-        if not r.ok:
-            try:
-                details = r.json()
-            except Exception:
-                details = r.text
-            raise RuntimeError(f"Telegram API {r.status_code}: {details}")
+        r.raise_for_status()
 
 
 def f(v, d=2):
@@ -51,178 +50,139 @@ def f(v, d=2):
         return "-"
 
 
-def asof_text(v):
-    if not v:
-        return "-"
-    try:
-        s = str(v).replace("Z", "+00:00")
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=MSK)
-        else:
-            dt = dt.astimezone(MSK)
-        return dt.strftime("%d.%m.%Y %H:%M") + " MSK"
-    except Exception:
-        return str(v)
-
-
-def candidate_card(x, compact=False):
+def candidate_card(x):
     side = x.get("side", "WAIT")
     status = x.get("status", "WAIT")
-    if status in ("LONG", "SHORT"):
-        label, icon = f"{side} — ВХОД ГОТОВ", "🔥"
-    elif side in ("LONG", "SHORT") and x.get("watch"):
-        label, icon = f"{side} — НАБЛЮДЕНИЕ", "🟡"
-    else:
-        label, icon = "WAIT", "⚪"
-
+    icon = "🔥" if status in ("LONG", "SHORT") else ("🟡" if x.get("watch") else "⚪")
+    label = f"{side} — ВХОД ГОТОВ" if status in ("LONG","SHORT") else (f"{side} — НАБЛЮДЕНИЕ" if x.get("watch") else "WAIT")
     lines = [
         f"{icon} <b>{html.escape(str(x.get('symbol')))} — {label}</b>",
-        f"Сила сетапа: <b>{f(x.get('score'), 1)}/100</b> | {x.get('regime', '-')}",
-        f"Цена: <b>{f(x.get('price'))}</b> | H1 {x.get('h1', '-')} / M15 {x.get('m15', '-')} / M5 {x.get('m5', '-')}",
+        f"Score: <b>{f(x.get('score'),1)}/100</b> | Цена: <b>{f(x.get('price'))}</b>",
+        f"H1 {html.escape(str(x.get('h1','-')))} / M15 {html.escape(str(x.get('m15','-')))} / M5 {html.escape(str(x.get('m5','-')))}",
     ]
-    if status in ("LONG", "SHORT"):
+    if status in ("LONG","SHORT"):
         lines += [
-            f"Вход <b>{f(x.get('entry'))}</b> | Trigger {f(x.get('trigger'))}",
+            f"Entry <b>{f(x.get('entry'))}</b> | Trigger {f(x.get('trigger'))}",
             f"SL <b>{f(x.get('sl'))}</b> | TP1 {f(x.get('tp1'))} | TP2 {f(x.get('tp2'))} | TP3 {f(x.get('tp3'))}",
-            f"R/R <b>{f(x.get('rr'))}</b> | RSI {f(x.get('rsi'), 1)} | объём {f(x.get('volume_ratio'))}x",
+            f"R/R <b>{f(x.get('rr'))}</b> | RSI {f(x.get('rsi'),1)} | Volume {f(x.get('volume_ratio'))}x",
         ]
-    elif side in ("LONG", "SHORT") and x.get("watch"):
-        lines += [
-            f"Триггер: <b>{f(x.get('trigger'))}</b> | до триггера {f(x.get('trigger_distance_atr'), 2)} ATR",
-            f"Условие: {html.escape(str(x.get('trigger_condition', 'breakout + retest M5')))[:260]}",
-            f"Почему ждём: {html.escape(str(x.get('reason', '-')))[:300]}",
-        ]
-    elif not compact:
-        lines.append(f"Причина: {html.escape(str(x.get('reason', '-')))[:300]}")
+    elif x.get("watch"):
+        lines.append("Триггер: <b>" + f(x.get("trigger")) + "</b>")
+        lines.append("Почему ждём: " + html.escape(str(x.get("reason","-")))[:350])
     return "\n".join(lines)
 
 
-def technical_summary(items):
-    technical = [x for x in items if str(x.get("reason", "")).lower().startswith(("ошибка", "недостаточно свечей"))]
-    if not technical:
-        return ""
-    insufficient = [x for x in technical if "недостаточно свечей" in str(x.get("reason", "")).lower()]
-    errors = len(technical) - len(insufficient)
-    parts = [f"⚪ Технически пропущено: {len(technical)}"]
-    if insufficient:
-        parts.append("нет достаточной истории: " + ", ".join(str(x.get("symbol", "-")) for x in insufficient[:8]))
-    if errors:
-        parts.append(f"ошибки анализа: {errors}")
-    return "\n".join(parts)
+def format_scan(result):
+    meta = result.get("meta", {})
+    all_items = (result.get("stocks", []) or []) + (result.get("futures", []) or [])
+    confirmed = sorted(
+        [x for x in all_items if x.get("status") in ("LONG","SHORT")],
+        key=lambda x: float(x.get("score") or 0),
+        reverse=True,
+    )[:2]
 
-
-def top(items, side, limit=3):
-    pool = [x for x in items if x.get("side") == side and not str(x.get("reason", "")).lower().startswith(("ошибка", "недостаточно свечей")) and (x.get("status") == side or x.get("watch"))]
-    return sorted(pool, key=lambda x: float(x.get("score") or 0), reverse=True)[:limit]
-
-
-def fmt(r):
-    stocks = r.get("stocks", [])
-    futures = r.get("futures", [])
-    allc = stocks + futures
-    sl, ss = top(stocks, "LONG"), top(stocks, "SHORT")
-    fl, fs = top(futures, "LONG"), top(futures, "SHORT")
-    confirmed = sorted([x for x in allc if x.get("status") in ("LONG", "SHORT")], key=lambda x: float(x.get("score") or 0), reverse=True)[:4]
-
-    meta = r.get("meta", {})
-    if meta.get("mode") == "HISTORICAL":
-        market_line = "🔵 <b>РЫНОК ЗАКРЫТ — ИСТОРИЧЕСКИЙ РЕЖИМ</b>"
-        if meta.get("asof"):
-            market_line += f"\nПоследняя доступная сессия: <b>{html.escape(asof_text(meta['asof']))}</b>"
-    else:
-        market_line = "🟢 <b>РЫНОК ОТКРЫТ / АКТУАЛЬНЫЕ ДАННЫЕ</b>"
+    def top(items, side):
+        return sorted(
+            [x for x in items if x.get("side")==side and (x.get("watch") or x.get("status")==side)],
+            key=lambda x: float(x.get("score") or 0), reverse=True
+        )[:3]
 
     out = [
-        "<b>📊 AA ANALITIK — MOEX v2.2</b>",
-        market_line,
-        f"Universe: TQBR {meta.get('stocks', 0)} | FORTS {meta.get('futures', 0)} | "
-        f"просмотрено: {meta.get('screened', 0)} | полный анализ: {meta.get('analyzed', 0)} | "
-        f"{meta.get('duration_sec', '-')} сек. | Quality gate: ON",
+        "<b>📊 AA ANALITIK v3.0</b>",
+        f"Просмотрено: {meta.get('screened',0)} | Анализ: {meta.get('analyzed',0)} | {meta.get('duration_sec','-')} сек.",
         "",
-        "<b>🏆 TOP LONG — АКЦИИ</b>",
-        *([candidate_card(x, compact=True) for x in sl] or ["— нет качественных кандидатов"]),
+        "<b>🏆 LONG — АКЦИИ</b>",
+        *[candidate_card(x) for x in top(result.get("stocks",[]), "LONG")],
         "",
-        "<b>🏆 TOP SHORT — АКЦИИ</b>",
-        *([candidate_card(x, compact=True) for x in ss] or ["— нет качественных кандидатов"]),
+        "<b>🏆 SHORT — АКЦИИ</b>",
+        *[candidate_card(x) for x in top(result.get("stocks",[]), "SHORT")],
         "",
-        "<b>🏆 TOP LONG — ФЬЮЧЕРСЫ</b>",
-        *([candidate_card(x, compact=True) for x in fl] or ["— нет качественных кандидатов"]),
+        "<b>🏆 LONG — ФЬЮЧЕРСЫ</b>",
+        *[candidate_card(x) for x in top(result.get("futures",[]), "LONG")],
         "",
-        "<b>🏆 TOP SHORT — ФЬЮЧЕРСЫ</b>",
-        *([candidate_card(x, compact=True) for x in fs] or ["— нет качественных кандидатов"]),
+        "<b>🏆 SHORT — ФЬЮЧЕРСЫ</b>",
+        *[candidate_card(x) for x in top(result.get("futures",[]), "SHORT")],
         "",
         "<b>🔥 ГОТОВЫЕ ВХОДЫ — МАКС. 2</b>",
-    ]
-    out += [candidate_card(x) for x in confirmed] or ["Нет подтверждённых входов. Ждём breakout + retest M5; в середине диапазона не входим."]
-
-    top_objs = sl + ss + fl + fs
-    extra = [x for x in allc if x.get("status") == "WAIT" and x.get("watch") and x not in top_objs]
-    extra = sorted(extra, key=lambda x: float(x.get("score") or 0), reverse=True)[:4]
-    out += ["", "<b>🟡 НАБЛЮДЕНИЕ — ТОЛЬКО ЛУЧШИЕ</b>"]
-    out += [candidate_card(x) for x in extra] or ["Дополнительных сильных кандидатов нет."]
-
-    tech = technical_summary(allc)
-    if tech:
-        out += ["", tech]
-
-    out += [
+        *([candidate_card(x) for x in confirmed] or ["Нет подтверждённых входов."]),
         "",
-        "<b>ℹ️ ВАЖНО</b>",
-        "TOP — рейтинг силы сетапа, а не сигнал на вход.",
-        "Вход — только после breakout + retest M5, подтверждения H1 и остальных фильтров.",
-        "🔵 В историческом режиме цена берётся из последней доступной свечи; это НЕ текущая котировка.",
-        "🔎 Полный Universe просмотрен по данным отбора; H1/M15/M5 глубоко анализируются у лучших кандидатов, чтобы сохранить скорость и устойчивость Render Free.",
-        "⚠️ Сила сетапа — рейтинг, не вероятность. Подтверждённых входов максимум 2; дубли одного базового актива отсекаются. Новости пока не подключены. Бот не отправляет ордера.",
+        "🧠 Каждый скан сохранён в журнал. Telegram получает только события.",
+        "🤖 Ордера бот не отправляет.",
     ]
-    return "\n\n".join(out)
+    return "\n".join(out)
 
 
-def scan_in_background(chat):
-    if not SCAN_LOCK.acquire(blocking=False):
-        send(chat, "🟡 <b>Сканирование уже выполняется.</b> Дождись текущего результата.")
-        return
-    try:
-        send(chat, "⏳ <b>Сканирование запущено.</b>\nTQBR + FORTS • H1/M15/M5\nRender-safe v2.2: весь Universe → быстрый отбор → полный H1/M15/M5 лучших кандидатов.")
-        send(chat, fmt(run_scan()))
-    except Exception as e:
-        print("SCAN ERROR:", repr(e), flush=True)
-        traceback.print_exc()
+def run_scan_job(chat=None, notify_events=True):
+    with SCAN_LOCK:
+        result = run_scan()
+        update_virtual_outcomes(result)
+        events = save_scan(result)
+        print(f"JOURNAL SAVED events={len(events)}", flush=True)
+
+    if chat:
+        send(chat, format_scan(result))
+
+    if notify_events and chat and events:
+        for e in events[:4]:
+            send(chat, "🔔 <b>Событие</b>\n" + html.escape(e["message"]))
+
+    return result, events
+
+
+def scan_worker():
+    print("SCAN WORKER STARTED", flush=True)
+    while True:
+        chat = SCAN_QUEUE.get()
         try:
-            send(chat, "❌ <b>Ошибка сканирования</b>\n" + html.escape(str(e))[:1200])
-        except Exception:
-            pass
-    finally:
-        SCAN_LOCK.release()
+            print(f"SCAN START chat={chat}", flush=True)
+            send(chat, "🔎 <b>Сканирование запущено</b>\nРезультат будет отправлен только один раз.")
+            run_scan_job(chat=chat, notify_events=True)
+            print("SCAN FINISHED", flush=True)
+        except Exception as exc:
+            print("SCAN WORKER ERROR:", repr(exc), flush=True)
+            traceback.print_exc()
+            try:
+                send(chat, "❌ <b>Ошибка сканирования</b>\n" + html.escape(str(exc))[:1500])
+            except Exception:
+                pass
+        finally:
+            SCAN_QUEUE.task_done()
 
 
-def handle(u):
-    m = u.get("message") or {}
-    chat = (m.get("chat") or {}).get("id")
-    t = (m.get("text") or "").strip().lower()
+threading.Thread(target=scan_worker, name="scan-worker", daemon=True).start()
+
+
+def handle(update):
+    print("TELEGRAM UPDATE RECEIVED", flush=True)
+    message = update.get("message") or {}
+    chat = (message.get("chat") or {}).get("id")
+    command = (message.get("text") or "").strip().lower().split("@",1)[0]
     if not chat:
         return
+
     try:
-        if t in ("/start", "/help"):
-            send(chat, "<b>AA Analitik Bot</b>\n\n/scan — полный быстрый скан\n/stocks — акции\n/futures — фьючерсы\n/status — состояние\n\nTOP ≠ сигнал. Бот НЕ отправляет ордера.")
-        elif t == "/status":
-            send(chat, "<b>AA Analitik</b>\nMOEX ISS • TQBR + FORTS • H1/M15/M5\nFast scanner v2.2: ON\nПолный Universe: ON\nТехнический анализ лучших кандидатов: ON\nНовости: не подключены\nОрдера: НЕ отправляются.\nWebhook: работает.")
-        elif t == "/scan":
-            threading.Thread(target=scan_in_background, args=(chat,), daemon=True).start()
-        elif t == "/stocks":
-            send(chat, "⏳ <b>Сканирую акции...</b>")
-            r = run_scan()
-            send(chat, "<b>АКЦИИ TQBR</b>\n\n" + "\n\n".join(candidate_card(x) for x in r["stocks"][:5]))
-        elif t == "/futures":
-            send(chat, "⏳ <b>Сканирую фьючерсы...</b>")
-            r = run_scan()
-            send(chat, "<b>ФЬЮЧЕРСЫ FORTS</b>\n\n" + "\n\n".join(candidate_card(x) for x in r["futures"][:5]))
+        if command in ("/start","/help"):
+            send(chat, "<b>AA Analitik v3.0</b>\n\n/scan или «скан» — полный скан\n/status — состояние\n/report — статистика журнала\n\nАвтоскан: каждые 15 минут.\nTelegram — только важные события.")
+        elif command == "/status":
+            stats = daily_stats()
+            send(chat, f"<b>AA Analitik v3.0</b>\nScanner v2.2: ON\nProtocol v1.3: ON\nАвтоскан: ON\nЖурнал наблюдений: ON\nНаблюдений: {stats['observations']}\nПодтверждённых сценариев: {stats['ready']}\n🤖 Ордера: НЕ отправляются.")
+        elif command == "/report":
+            s = daily_stats()
+            wr = "-" if s["win_rate"] is None else f"{s['win_rate']:.1f}%"
+            ar = "-" if s["avg_r"] is None else f"{s['avg_r']:+.2f}R"
+            send(chat, f"<b>🧠 AA ANALITIK — ЖУРНАЛ</b>\nНаблюдений: {s['observations']}\nПодтверждённых сценариев: {s['ready']}\nЗавершено: {s['closed']}\nУспешных: {s['wins']}\nWin Rate: {wr}\nСредний результат: {ar}")
+        elif command in ("/scan","scan","скан"):
+            try:
+                SCAN_QUEUE.put_nowait(chat)
+                send(chat, "🟡 <b>Скан поставлен в очередь.</b>")
+            except queue.Full:
+                send(chat, "🟠 <b>Сканирование уже выполняется.</b>")
         else:
-            send(chat, "Неизвестная команда. /help")
-    except Exception as e:
-        print("BOT ERROR:", repr(e), flush=True)
+            send(chat, "Используй /scan, «скан», /status или /report.")
+    except Exception as exc:
+        print("BOT ERROR:", repr(exc), flush=True)
         traceback.print_exc()
         try:
-            send(chat, "❌ <b>Ошибка бота</b>\n" + html.escape(str(e))[:1200])
+            send(chat, "❌ <b>Ошибка бота</b>\n" + html.escape(str(exc))[:1500])
         except Exception:
             pass
