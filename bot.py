@@ -144,7 +144,7 @@ def scan_status_text():
         "Состояние сканера",
         f"Состояние: {'ЗАПУЩЕН' if running else 'НЕ ЗАПУЩЕН'}",
         f"Worker: {'RUNNING' if running else 'OK/IDLE'}",
-        "Очередь: отсутствует (v3.2.1)",
+        "Очередь: отсутствует (v3.2.5)",
         f"Последний старт: {_fmt_dt(start)}",
         f"Последнее завершение: {_fmt_dt(finish)}",
     ]
@@ -446,6 +446,7 @@ def _trade_menu(chat_id):
                 [{"text": "🔴 Открыть продажу / SHORT", "callback_data": "trade:SHORT"}],
                 [{"text": "🔒 Закрыть позицию", "callback_data": "trade:close"}],
                 [{"text": "📋 Последние сделки", "callback_data": "trade:list"}],
+                [{"text": "🧹 Очистить тестовые сделки", "callback_data": "trade:reset"}],
             ]
         },
     )
@@ -838,6 +839,14 @@ def _handle_trade_callback(callback):
         _close_menu(chat_id)
         return
 
+    if data == "trade:reset":
+        _trade_reset_menu(chat_id)
+        return
+
+    if data == "trade:reset_confirm":
+        _trade_reset(chat_id)
+        return
+
     if data.startswith("close:"):
         try:
             trade_id = int(data.split(":", 1)[1])
@@ -967,6 +976,109 @@ def _handle_trade_form(chat_id, text):
 
 
 
+def _help_text():
+    return (
+        "🤖 Мой аналитик\n\n"
+        "Команды:\n"
+        "/scan — запустить сканирование\n"
+        "/scanstatus — состояние сканера\n"
+        "/market — состояние рынка MOEX\n"
+        "/trade — журнал и ввод сделки\n"
+        "/close — закрыть открытую позицию\n"
+        "/report — отчёт по журналу сделок\n"
+        "/status — состояние бота\n"
+        "/cancel — отменить текущий ввод\n\n"
+        "Важное: бот только фиксирует сделки и не отправляет заявки брокеру."
+    )
+
+
+def _status_text():
+    with STATE_LOCK:
+        running = SCAN_RUNNING
+        start = LAST_SCAN_START
+        finish = LAST_SCAN_FINISH
+        error = LAST_SCAN_ERROR
+    return (
+        "Мой аналитик: OK\n"
+        f"Сканер: {'RUNNING' if running else 'IDLE'}\n"
+        "Webhook handler: OK\n"
+        f"Последний старт: {_fmt_dt(start)}\n"
+        f"Последнее завершение: {_fmt_dt(finish)}"
+        + (f"\nПоследняя ошибка: {error}" if error else "")
+    )
+
+
+def _journal_report():
+    con = _trade_db()
+    try:
+        total = con.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        opened = con.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'").fetchone()[0]
+        closed = con.execute("SELECT COUNT(*) FROM trades WHERE status='CLOSED'").fetchone()[0]
+        wins = con.execute("SELECT COUNT(*) FROM trades WHERE status='CLOSED' AND result_r > 0").fetchone()[0]
+        losses = con.execute("SELECT COUNT(*) FROM trades WHERE status='CLOSED' AND result_r < 0").fetchone()[0]
+        breakeven = con.execute("SELECT COUNT(*) FROM trades WHERE status='CLOSED' AND result_r = 0").fetchone()[0]
+        avg_r = con.execute("SELECT AVG(result_r) FROM trades WHERE status='CLOSED' AND result_r IS NOT NULL").fetchone()[0]
+        sum_r = con.execute("SELECT SUM(result_r) FROM trades WHERE status='CLOSED' AND result_r IS NOT NULL").fetchone()[0]
+        longs = con.execute("SELECT COUNT(*) FROM trades WHERE side='LONG'").fetchone()[0]
+        shorts = con.execute("SELECT COUNT(*) FROM trades WHERE side='SHORT'").fetchone()[0]
+        latest = con.execute("SELECT id,symbol,side,entry,close_price,result_r,status FROM trades ORDER BY id DESC LIMIT 5").fetchall()
+    finally:
+        con.close()
+
+    lines = [
+        "📊 Отчёт журнала сделок",
+        f"Всего сделок: {total}",
+        f"Открытых: {opened}",
+        f"Закрытых: {closed}",
+        f"Прибыльных: {wins}",
+        f"Убыточных: {losses}",
+        f"Без результата: {breakeven}",
+        f"LONG: {longs} | SHORT: {shorts}",
+        f"Win rate: {(wins / closed * 100):.1f}%" if closed else "Win rate: —",
+        f"Средний результат: {avg_r:+.2f} R" if avg_r is not None else "Средний результат: —",
+        f"Суммарный результат: {sum_r:+.2f} R" if sum_r is not None else "Суммарный результат: —",
+        "",
+        "Последние сделки:",
+    ]
+    if not latest:
+        lines.append("— журнал пуст")
+    else:
+        for tid, symbol, side, entry, close_price, result_r, status in latest:
+            result = f" | {result_r:+.2f} R" if result_r is not None else ""
+            close = f" → {close_price}" if close_price is not None else ""
+            lines.append(f"#{tid} {symbol} {side}: {entry}{close} | {status}{result}")
+    return "\n".join(lines)
+
+
+def _trade_reset_menu(chat_id):
+    return _send_markup(
+        chat_id,
+        "🧹 Очистка журнала сделок\n\n"
+        "Это удалит все записи из таблицы реальных сделок бота.\n"
+        "Наблюдения сканера НЕ удаляются.\n\n"
+        "Подтвердить очистку?",
+        {
+            "inline_keyboard": [
+                [{"text": "🗑 Удалить сделки", "callback_data": "trade:reset_confirm"}],
+                [{"text": "Отмена", "callback_data": "trade:menu"}],
+            ]
+        },
+    )
+
+
+def _trade_reset(chat_id):
+    con = _trade_db()
+    try:
+        count = con.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        con.execute("DELETE FROM trades")
+        con.execute("DELETE FROM sqlite_sequence WHERE name='trades'")
+        con.commit()
+    finally:
+        con.close()
+    send(chat_id, f"🧹 Журнал сделок очищен. Удалено записей: {count}.\nНаблюдения сканера сохранены.")
+
+
+
 def handle(update):
     global LAST_CHAT_ID
 
@@ -1013,6 +1125,10 @@ def handle(update):
 
     if command in ("/close", "close", "/закрыть", "закрыть"):
         _close_menu(chat_id)
+        return
+
+    if command in ("/tradereset", "tradereset"):
+        _trade_reset_menu(chat_id)
         return
 
     if command in ("/market", "market", "рынок"):
