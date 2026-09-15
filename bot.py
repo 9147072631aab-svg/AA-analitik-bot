@@ -64,7 +64,10 @@ CREATE TABLE IF NOT EXISTS trades (
     status TEXT DEFAULT 'OPEN',
     close_price REAL,
     result_r REAL,
-    closed_ts TEXT
+    closed_ts TEXT,
+    close_side TEXT,
+    parent_trade_id INTEGER,
+    close_notes TEXT
 );
 """
 
@@ -387,6 +390,7 @@ def _trade_db():
     con = sqlite3.connect(TRADE_DB_PATH, timeout=30)
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript(TRADE_SCHEMA)
+    _ensure_trade_columns(con)
     return con
 
 
@@ -395,6 +399,19 @@ def _trade_num(value):
         return float(str(value).strip().replace(",", "."))
     except Exception:
         return None
+
+
+def _ensure_trade_columns(con):
+    existing = {row[1] for row in con.execute("PRAGMA table_info(trades)")}
+    wanted = {
+        "close_side": "TEXT",
+        "parent_trade_id": "INTEGER",
+        "close_notes": "TEXT",
+    }
+    for name, sql_type in wanted.items():
+        if name not in existing:
+            con.execute(f"ALTER TABLE trades ADD COLUMN {name} {sql_type}")
+    con.commit()
 
 
 def _latest_scan_observation(symbol, side):
@@ -420,13 +437,14 @@ def _trade_menu(chat_id):
     return _send_markup(
         chat_id,
         "📝 Журнал сделок\n\n"
-        "Выбери направление сделки.\n"
-        "После заполнения данные будут записаны в журнал автоматически.\n\n"
-        "⚠️ Бот только фиксирует сделку. Ордера брокеру не отправляются.",
+        "Открытие и закрытие позиции теперь являются одной сделкой.\n"
+        "Если купил SBER — закрытие SBER через SELL будет привязано к этой же записи.\n\n"
+        "Выбери действие:",
         {
             "inline_keyboard": [
-                [{"text": "🟢 Покупка / LONG", "callback_data": "trade:LONG"}],
-                [{"text": "🔴 Продажа / SHORT", "callback_data": "trade:SHORT"}],
+                [{"text": "🟢 Открыть покупку / LONG", "callback_data": "trade:LONG"}],
+                [{"text": "🔴 Открыть продажу / SHORT", "callback_data": "trade:SHORT"}],
+                [{"text": "🔒 Закрыть позицию", "callback_data": "trade:close"}],
                 [{"text": "📋 Последние сделки", "callback_data": "trade:list"}],
             ]
         },
@@ -568,12 +586,166 @@ def _create_trade(chat_id, draft):
     return trade_id, obs, rr
 
 
+def _open_trades():
+    con = _trade_db()
+    try:
+        rows = con.execute(
+            """SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,quantity,risk_rub,
+                      created_ts,scanner_score
+               FROM trades
+               WHERE status='OPEN'
+               ORDER BY id DESC
+               LIMIT 20"""
+        ).fetchall()
+    finally:
+        con.close()
+    return rows
+
+
+def _close_menu(chat_id):
+    rows = _open_trades()
+    if not rows:
+        send(chat_id, "📋 Открытых позиций нет.")
+        return
+
+    buttons = []
+    for row in rows:
+        trade_id, symbol, side, entry, sl, tp1, tp2, tp3, qty, risk_rub, created_ts, score = row
+        direction = "🟢" if side == "LONG" else "🔴"
+        label = f"{direction} #{trade_id} {symbol} {side} @ {entry}"
+        buttons.append([{"text": label[:60], "callback_data": f"close:{trade_id}"}])
+
+    buttons.append([{"text": "↩️ Назад", "callback_data": "trade:menu"}])
+    _send_markup(
+        chat_id,
+        "🔒 Закрытие позиции\n\n"
+        "Выбери открытую позицию. Продажа LONG будет записана как закрытие "
+        "покупки, а покупка SHORT — как закрытие продажи.\n\n"
+        "Новая сделка для закрытия не создаётся.",
+        {"inline_keyboard": buttons},
+    )
+
+
+def _close_position_prompt(chat_id, trade_id):
+    con = _trade_db()
+    try:
+        row = con.execute(
+            """SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,quantity,risk_rub,
+                      created_ts,scanner_score
+               FROM trades WHERE id=? AND status='OPEN'""",
+            (trade_id,),
+        ).fetchone()
+    finally:
+        con.close()
+
+    if not row:
+        send(chat_id, "Эта позиция уже закрыта или не найдена.")
+        return
+
+    trade_id, symbol, side, entry, sl, tp1, tp2, tp3, qty, risk_rub, created_ts, score = row
+    _draft_set(
+        chat_id,
+        close_mode=True,
+        close_trade_id=trade_id,
+        close_side=("SHORT" if side == "LONG" else "LONG"),
+        step=1,
+    )
+    send(
+        chat_id,
+        f"🔒 Закрытие #{trade_id}: {symbol} {side}\n"
+        f"Вход: {entry}\n"
+        f"SL: {sl}\n\n"
+        "Шаг 1/2 — фактическая цена закрытия.",
+    )
+
+
+def _close_trade(chat_id, draft):
+    trade_id = int(draft["close_trade_id"])
+    close_price = float(draft["close_price"])
+
+    con = _trade_db()
+    try:
+        row = con.execute(
+            """SELECT id,symbol,side,entry,sl,quantity,risk_rub,status
+               FROM trades WHERE id=?""",
+            (trade_id,),
+        ).fetchone()
+
+        if not row:
+            raise ValueError("позиция не найдена")
+        if row[7] != "OPEN":
+            raise ValueError("позиция уже закрыта")
+
+        _, symbol, side, entry, sl, quantity, risk_rub, _ = row
+        risk_distance = abs(entry - sl)
+
+        if side == "LONG":
+            pnl_distance = close_price - entry
+        else:
+            pnl_distance = entry - close_price
+
+        result_r = None
+        if risk_distance > 0:
+            result_r = pnl_distance / risk_distance
+
+        con.execute(
+            """UPDATE trades
+               SET close_price=?,
+                   result_r=?,
+                   closed_ts=?,
+                   close_side=?,
+                   close_notes=?,
+                   status='CLOSED'
+               WHERE id=? AND status='OPEN'""",
+            (
+                close_price,
+                result_r,
+                _now().isoformat(),
+                draft.get("close_side"),
+                draft.get("close_notes"),
+                trade_id,
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    return {
+        "id": trade_id,
+        "symbol": symbol,
+        "side": side,
+        "entry": entry,
+        "sl": sl,
+        "quantity": quantity,
+        "risk_rub": risk_rub,
+        "close_price": close_price,
+        "result_r": result_r,
+    }
+
+
+def _close_saved_text(position):
+    r = position["result_r"]
+    r_text = f"{r:+.2f} R" if r is not None else "—"
+    pnl_text = "прибыль" if r is not None and r > 0 else ("убыток" if r is not None and r < 0 else "результат без R")
+    return (
+        "✅ Позиция закрыта\n"
+        f"Сделка #{position['id']}\n"
+        f"Инструмент: {position['symbol']}\n"
+        f"Открытие: {position['side']} @ {position['entry']}\n"
+        f"Закрытие: {'SELL' if position['side']=='LONG' else 'BUY'} @ {position['close_price']}\n"
+        f"Количество: {position['quantity'] or '—'}\n"
+        f"Результат: {r_text} ({pnl_text})\n\n"
+        "Открытие и закрытие связаны в одной записи журнала.\n"
+        "Ордера брокеру НЕ отправлялись."
+    )
+
+
 def _trade_list():
     con = _trade_db()
     try:
         rows = con.execute(
             """SELECT id,created_ts,symbol,side,entry,sl,tp1,tp2,tp3,
-                      quantity,risk_rub,rr,status,result_r
+                      quantity,risk_rub,rr,status,close_price,result_r,closed_ts
                FROM trades ORDER BY id DESC LIMIT 10"""
         ).fetchall()
     finally:
@@ -586,16 +758,26 @@ def _trade_list():
     for row in rows:
         (
             trade_id, created_ts, symbol, side, entry, sl, tp1, tp2, tp3,
-            quantity, risk_rub, rr, status, result_r
+            quantity, risk_rub, rr, status, close_price, result_r, closed_ts
         ) = row
+
         rr_text = f", RR={rr:.2f}" if rr is not None else ""
-        result_text = f", R={result_r:.2f}" if result_r is not None else ""
+        if status == "CLOSED":
+            close_text = f" → закрытие {close_price}"
+            result_text = f", результат {result_r:+.2f} R" if result_r is not None else ""
+            status_text = "CLOSED"
+        else:
+            close_text = ""
+            result_text = ""
+            status_text = "OPEN"
+
         lines.append(
             f"#{trade_id} {symbol} {side} | вход {entry} | SL {sl} | "
             f"TP1 {tp1 or '—'} | объём {quantity or '—'} | "
-            f"{status}{rr_text}{result_text}"
+            f"{status_text}{close_text}{rr_text}{result_text}"
         )
     return "\n".join(lines)
+
 
 
 def _trade_saved_text(trade_id, draft, obs, rr):
@@ -648,16 +830,35 @@ def _handle_trade_callback(callback):
         send(chat_id, _trade_list())
         return
 
+    if data == "trade:menu":
+        _trade_menu(chat_id)
+        return
+
+    if data == "trade:close":
+        _close_menu(chat_id)
+        return
+
+    if data.startswith("close:"):
+        try:
+            trade_id = int(data.split(":", 1)[1])
+        except Exception:
+            send(chat_id, "Не удалось определить сделку.")
+            return
+        _close_position_prompt(chat_id, trade_id)
+        return
+
     if data in ("trade:LONG", "trade:SHORT"):
         side = data.split(":", 1)[1]
-        _draft_set(chat_id, side=side, step=1)
+        _draft_set(chat_id, side=side, step=1, close_mode=False)
         send(
             chat_id,
-            ("🟢 Заполнение покупки / LONG\n\n" if side == "LONG"
-             else "🔴 Заполнение продажи / SHORT\n\n")
+            ("🟢 Открытие покупки / LONG\n\n" if side == "LONG"
+             else "🔴 Открытие продажи / SHORT\n\n")
             + _trade_prompt(1)
             + "\n\nДля отмены: /cancel",
         )
+
+
 
 
 def _handle_trade_form(chat_id, text):
@@ -665,12 +866,43 @@ def _handle_trade_form(chat_id, text):
     if not draft:
         return False
 
-    step = int(draft.get("step", 1))
-
     if text.lower() in ("/cancel", "cancel", "отмена"):
         _draft_clear(chat_id)
         send(chat_id, "Заполнение сделки отменено.")
         return True
+
+    # Closing an existing position is intentionally a separate short form.
+    if draft.get("close_mode"):
+        step = int(draft.get("step", 1))
+
+        if step == 1:
+            value = _trade_num(text)
+            if value is None:
+                send(chat_id, "Нужно число. Например: 289.40")
+                return True
+            _draft_set(chat_id, close_price=value, step=2)
+            send(
+                chat_id,
+                "Шаг 2/2 — комментарий к закрытию.\n"
+                "Если комментария нет — напиши «нет».",
+            )
+            return True
+
+        if step == 2:
+            _draft_set(chat_id, close_notes=text.strip() or "нет", step=3)
+            draft = _draft_get(chat_id)
+            try:
+                position = _close_trade(chat_id, draft)
+                _draft_clear(chat_id)
+                send(chat_id, _close_saved_text(position))
+            except Exception as exc:
+                _draft_clear(chat_id)
+                print(f"TRADE CLOSE ERROR: {type(exc).__name__}: {exc}", flush=True)
+                send(chat_id, f"Ошибка закрытия позиции: {type(exc).__name__}: {exc}")
+            return True
+
+    # Opening a new position.
+    step = int(draft.get("step", 1))
 
     if step == 1:
         symbol = text.strip().upper().replace(" ", "")
@@ -707,7 +939,6 @@ def _handle_trade_form(chat_id, text):
             send(chat_id, "Не удалось записать: отсутствует вход или SL.")
             return True
 
-        # Validate SL direction before saving.
         if (
             draft["side"] == "LONG" and draft["sl"] >= draft["entry"]
         ) or (
@@ -734,44 +965,6 @@ def _handle_trade_form(chat_id, text):
     send(chat_id, _trade_prompt(int(draft["step"])))
     return True
 
-
-def _help_text():
-    return (
-        "Мой аналитик\n\n"
-        "Команды:\n"
-        "/scan — запустить сканирование MOEX\n"
-        "/scanstatus — состояние сканера\n"
-        "/market — состояние рынка\n"
-        "/report — статистика журнала\n"
-        "/status — состояние бота"
-    )
-
-
-def _journal_report():
-    try:
-        stats = journal.daily_stats()
-
-        if isinstance(stats, dict):
-            return "\n".join(
-                ["Отчёт журнала"]
-                + [f"{key}: {value}" for key, value in stats.items()]
-            )
-
-        return f"Отчёт журнала\n{stats}"
-
-    except Exception as exc:
-        return f"Ошибка отчёта: {type(exc).__name__}: {exc}"
-
-
-def _status_text():
-    with STATE_LOCK:
-        running = SCAN_RUNNING
-
-    return (
-        "Мой аналитик: OK\n"
-        f"Сканер: {'RUNNING' if running else 'IDLE'}\n"
-        "Webhook handler: OK"
-    )
 
 
 def handle(update):
@@ -816,6 +1009,10 @@ def handle(update):
 
     if command in ("/trade", "trade", "/сделка", "сделка"):
         _trade_menu(chat_id)
+        return
+
+    if command in ("/close", "close", "/закрыть", "закрыть"):
+        _close_menu(chat_id)
         return
 
     if command in ("/market", "market", "рынок"):
