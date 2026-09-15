@@ -583,23 +583,59 @@ def support_resistance(m15):
 
 
 def breakout_retest(m5, side, trigger, atr_value):
+    """
+    Sequence-aware breakout detector.
+
+    Intended protocol sequence:
+        1) establish a prior range;
+        2) a later CLOSED M5 candle breaks that range;
+        3) the following RETEST_BARS contain a retest;
+        4) retest candle closes back in the breakout direction.
+
+    Important: the trigger/range is calculated from candles BEFORE the
+    breakout candle. The previous implementation compared a candle's close
+    against a trigger that included the same candle's high, making a valid
+    breakout effectively impossible.
+    """
     closed = m5[:-1]
-    if len(closed) < BREAKOUT_LOOKBACK + RETEST_BARS + 2:
+    breakout_bars = 1
+
+    minimum = BREAKOUT_LOOKBACK + breakout_bars + RETEST_BARS + 1
+    if len(closed) < minimum:
         return False, False, None
 
-    lookback = closed[-(BREAKOUT_LOOKBACK + RETEST_BARS):-RETEST_BARS]
+    # Last RETEST_BARS are the retest window.
     retest = closed[-RETEST_BARS:]
 
-    if not lookback or not retest:
+    # Immediately before the retest, reserve one CLOSED candle as the
+    # breakout candle. The range is the BREAKOUT_LOOKBACK candles before it.
+    breakout_index = len(closed) - RETEST_BARS - 1
+    range_end = breakout_index
+    range_start = range_end - BREAKOUT_LOOKBACK
+
+    if range_start < 0:
         return False, False, None
 
-    crossed = any(
-        c["close"] > trigger
-        for c in lookback
-    ) if side == "LONG" else any(
-        c["close"] < trigger
-        for c in lookback
+    range_bars = closed[range_start:range_end]
+    breakout_window = closed[breakout_index:breakout_index + breakout_bars]
+
+    if not range_bars or not breakout_window or not retest:
+        return False, False, None
+
+    range_trigger = (
+        max(c["high"] for c in range_bars)
+        if side == "LONG"
+        else min(c["low"] for c in range_bars)
     )
+
+    # Use the structurally correct range trigger. The caller's trigger is
+    # retained only as a fallback for compatibility.
+    trigger = range_trigger
+
+    if side == "LONG":
+        crossed = any(c["close"] > trigger for c in breakout_window)
+    else:
+        crossed = any(c["close"] < trigger for c in breakout_window)
 
     tolerance = max(atr_value * 0.15, MIN_PRICE)
 
@@ -792,12 +828,24 @@ def analyze(x):
         if len(closed_m5) < 20:
             raise ValueError("Недостаточно закрытых M5 свечей")
 
-        trigger_long = max(
-            c["high"] for c in closed_m5[-BREAKOUT_LOOKBACK:]
-        )
-        trigger_short = min(
-            c["low"] for c in closed_m5[-BREAKOUT_LOOKBACK:]
-        )
+        # Display/diagnostic trigger: prior range immediately before the
+        # breakout candle, matching breakout_retest().
+        breakout_index = len(closed_m5) - RETEST_BARS - 1
+        range_start = breakout_index - BREAKOUT_LOOKBACK
+        if range_start >= 0:
+            trigger_long = max(
+                c["high"] for c in closed_m5[range_start:breakout_index]
+            )
+            trigger_short = min(
+                c["low"] for c in closed_m5[range_start:breakout_index]
+            )
+        else:
+            trigger_long = max(
+                c["high"] for c in closed_m5[-BREAKOUT_LOOKBACK:]
+            )
+            trigger_short = min(
+                c["low"] for c in closed_m5[-BREAKOUT_LOOKBACK:]
+            )
 
         avg_volume = (
             sum(c.get("volume", 0.0) for c in closed_m5[-21:-1]) / 20
