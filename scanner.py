@@ -1156,6 +1156,64 @@ def run_scan():
     stocks_out = [x for x in results if x.get("kind") == "stock"]
     futures_out = [x for x in results if x.get("kind") == "future"]
 
+    # Diagnostics only: this layer explains WAIT decisions.
+    # It does NOT change thresholds or quality-gate rules.
+    blocker_counts = Counter()
+    for item in results:
+        for blocker in item.get("hard_blockers") or []:
+            blocker_counts[blocker] += 1
+
+    watch_candidates = [
+        x for x in results
+        if x.get("score", 0) >= WATCH_SCORE
+    ]
+    min_score_candidates = [
+        x for x in results
+        if x.get("score", 0) >= MIN_SCORE
+    ]
+
+    confirmed_before_cap = [
+        x for x in results
+        if x.get("status") in ("LONG", "SHORT")
+    ]
+
+    diagnostics = {
+        "total_analyzed": len(results),
+        "watch_score": WATCH_SCORE,
+        "min_score": MIN_SCORE,
+        "watch_score_candidates": len(watch_candidates),
+        "min_score_candidates": len(min_score_candidates),
+        "confirmed_before_cap": len(confirmed_before_cap),
+        "confirmed_final": len(confirmed),
+        "blocker_counts": dict(
+            sorted(
+                blocker_counts.items(),
+                key=lambda pair: pair[1],
+                reverse=True,
+            )
+        ),
+        "top_waits": [
+            {
+                "symbol": x.get("symbol") or x.get("secid"),
+                "kind": x.get("kind"),
+                "side": x.get("side"),
+                "score": x.get("score"),
+                "trigger_distance_atr": x.get("trigger_distance_atr"),
+                "breakout": x.get("breakout"),
+                "retest": x.get("retest"),
+                "adx": x.get("adx"),
+                "plus_di": x.get("plus_di"),
+                "minus_di": x.get("minus_di"),
+                "hard_blockers": x.get("hard_blockers") or [],
+            }
+            for x in sorted(
+                watch_candidates,
+                key=lambda item: item.get("score", 0),
+                reverse=True,
+            )[:8]
+        ],
+    }
+
     duration = round(time.monotonic() - scan_started, 2)
 
     log.info(
@@ -1230,5 +1288,6 @@ def run_scan():
                 "max 2 quality signals",
             ],
             "duration_sec": duration,
+            "diagnostics": diagnostics,
         },
     }

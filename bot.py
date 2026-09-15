@@ -135,9 +135,50 @@ def _extract_scan_text(result):
             return value
 
     confirmed = result.get("confirmed") or []
+    meta = result.get("meta") or {}
+    diagnostics = meta.get("diagnostics") or {}
 
     if not confirmed:
-        return "Сигналов, прошедших полный quality gate, нет."
+        parts = ["Сигналов, прошедших полный quality gate, нет."]
+
+        total = diagnostics.get("total_analyzed")
+        min_score = diagnostics.get("min_score")
+        watch_score = diagnostics.get("watch_score")
+        min_count = diagnostics.get("min_score_candidates")
+        watch_count = diagnostics.get("watch_score_candidates")
+
+        if total is not None:
+            parts.append(f"Проверено: {total}")
+        if min_count is not None and min_score is not None:
+            parts.append(f"Score >= {min_score:g}: {min_count}")
+        if watch_count is not None and watch_score is not None:
+            parts.append(f"Score >= {watch_score:g}: {watch_count}")
+
+        blocker_counts = diagnostics.get("blocker_counts") or {}
+        if blocker_counts:
+            parts.append("")
+            parts.append("Главные блокеры quality gate:")
+            for blocker, count in list(blocker_counts.items())[:6]:
+                parts.append(f"• {blocker}: {count}")
+
+        top_waits = diagnostics.get("top_waits") or []
+        if top_waits:
+            parts.append("")
+            parts.append("Лучшие кандидаты и причины WAIT:")
+            for item in top_waits[:5]:
+                symbol = item.get("symbol") or "?"
+                side = item.get("side") or "WAIT"
+                score = item.get("score")
+                label = f"{symbol} {side}"
+                if score is not None:
+                    label += f" ({score})"
+                parts.append(label)
+
+                blockers = item.get("hard_blockers") or []
+                for blocker in blockers[:4]:
+                    parts.append(f"  • {blocker}")
+
+        return "\n".join(parts)
 
     parts = ["Подтвержденные сигналы:"]
 
