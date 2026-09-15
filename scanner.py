@@ -1157,8 +1157,130 @@ def run_scan():
     stocks_out = [x for x in results if x.get("kind") == "stock"]
     futures_out = [x for x in results if x.get("kind") == "future"]
 
-    # Diagnostics only: this layer explains WAIT decisions.
-    # It does NOT change thresholds or quality-gate rules.
+    # Diagnostics only: sequential quality-gate funnel.
+    # Trading rules and thresholds are unchanged.
+    def funnel_count(items, predicate):
+        return sum(1 for item in items if predicate(item))
+
+    funnel = []
+
+    # The scanner universe is already selected from the liquidity-ranked pools.
+    funnel.append({"stage": "liquidity_universe", "count": len(results)})
+
+    s60 = [x for x in results if x.get("score", 0) >= WATCH_SCORE]
+    s62 = [x for x in s60 if x.get("score", 0) >= MIN_SCORE]
+    funnel.append({"stage": "score_ge_watch", "count": len(s60)})
+    funnel.append({"stage": "score_ge_min", "count": len(s62)})
+
+    # From this point onward, each stage is applied to survivors of the
+    # previous stage, producing a true funnel rather than overlapping counts.
+    aligned = [
+        x for x in s62
+        if (
+            x.get("side") in ("LONG", "SHORT")
+            and (
+                (x.get("side") == "LONG"
+                 and x.get("h1") == "UP"
+                 and x.get("m15") == "UP"
+                 and x.get("m5") == "UP")
+                or
+                (x.get("side") == "SHORT"
+                 and x.get("h1") == "DOWN"
+                 and x.get("m15") == "DOWN"
+                 and x.get("m5") == "DOWN")
+            )
+        )
+    ]
+    funnel.append({"stage": "h1_m15_m5_alignment", "count": len(aligned)})
+
+    adx_ok = []
+    for x in aligned:
+        side = x.get("side")
+        adx_ok.append(x) if (
+            x.get("adx", 0) >= ADX_MIN
+            and (
+                (side == "LONG" and x.get("plus_di", 0) > x.get("minus_di", 0))
+                or
+                (side == "SHORT" and x.get("minus_di", 0) > x.get("plus_di", 0))
+            )
+        ) else None
+    funnel.append({"stage": "adx_di_confirmation", "count": len(adx_ok)})
+
+    vwap_ok = [
+        x for x in adx_ok
+        if (
+            (x.get("side") == "LONG" and x.get("price", 0) > x.get("vwap", 0))
+            or
+            (x.get("side") == "SHORT" and x.get("price", 0) < x.get("vwap", 0))
+        )
+    ]
+    funnel.append({"stage": "vwap_confirmation", "count": len(vwap_ok)})
+
+    value_ok = [
+        x for x in vwap_ok
+        if not (
+            x.get("val") is not None
+            and x.get("vah") is not None
+            and x.get("val", 0) < x.get("price", 0) < x.get("vah", 0)
+        )
+    ]
+    funnel.append({"stage": "outside_value_area", "count": len(value_ok)})
+
+    # Reconstruct the midrange test from the reported S/R values.
+    midrange_ok = []
+    for x in value_ok:
+        support_value = x.get("support")
+        resistance_value = x.get("resistance")
+        price_value = x.get("price")
+        if support_value is None or resistance_value is None or price_value is None:
+            continue
+        low = support_value + (resistance_value - support_value) * 0.30
+        high = support_value + (resistance_value - support_value) * 0.70
+        if not (low < price_value < high):
+            midrange_ok.append(x)
+    funnel.append({"stage": "midrange_filter", "count": len(midrange_ok)})
+
+    breakout_ok = [x for x in midrange_ok if x.get("breakout") is True]
+    funnel.append({"stage": "breakout", "count": len(breakout_ok)})
+
+    retest_ok = [x for x in breakout_ok if x.get("retest") is True]
+    funnel.append({"stage": "retest_confirmation", "count": len(retest_ok)})
+
+    trigger_ok = [
+        x for x in retest_ok
+        if x.get("trigger_distance_atr") is not None
+        and x.get("trigger_distance_atr", 999) <= MAX_TRIGGER_ATR
+    ]
+    funnel.append({"stage": "trigger_distance_le_1_5_atr", "count": len(trigger_ok)})
+
+    sl_ok = []
+    for x in trigger_ok:
+        price_value = x.get("price")
+        sl_value = x.get("sl")
+        side = x.get("side")
+        if price_value is None or sl_value is None:
+            continue
+        if (side == "LONG" and sl_value < price_value) or (
+            side == "SHORT" and sl_value > price_value
+        ):
+            sl_ok.append(x)
+    funnel.append({"stage": "structural_sl", "count": len(sl_ok)})
+
+    rr_ok = [
+        x for x in sl_ok
+        if x.get("rr") is not None and x.get("rr", 0) >= 2.0
+    ]
+    funnel.append({"stage": "minimum_rr_ge_2", "count": len(rr_ok)})
+
+    # Final status is the actual result of the complete gate before the
+    # portfolio-level cap of max two unique signals.
+    final_gate = [
+        x for x in rr_ok
+        if x.get("status") in ("LONG", "SHORT")
+    ]
+    funnel.append({"stage": "full_quality_gate", "count": len(final_gate)})
+    funnel.append({"stage": "max_2_final_signals", "count": len(confirmed)})
+
     blocker_counts = Counter()
     for item in results:
         for blocker in item.get("hard_blockers") or []:
@@ -1173,19 +1295,15 @@ def run_scan():
         if x.get("score", 0) >= MIN_SCORE
     ]
 
-    confirmed_before_cap = [
-        x for x in results
-        if x.get("status") in ("LONG", "SHORT")
-    ]
-
     diagnostics = {
         "total_analyzed": len(results),
         "watch_score": WATCH_SCORE,
         "min_score": MIN_SCORE,
         "watch_score_candidates": len(watch_candidates),
         "min_score_candidates": len(min_score_candidates),
-        "confirmed_before_cap": len(confirmed_before_cap),
+        "confirmed_before_cap": len(final_gate),
         "confirmed_final": len(confirmed),
+        "funnel": funnel,
         "blocker_counts": dict(
             sorted(
                 blocker_counts.items(),

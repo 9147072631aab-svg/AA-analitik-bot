@@ -154,6 +154,32 @@ def _extract_scan_text(result):
         if watch_count is not None and watch_score is not None:
             parts.append(f"Score >= {watch_score:g}: {watch_count}")
 
+        funnel = diagnostics.get("funnel") or []
+        if funnel:
+            labels = {
+                "liquidity_universe": "Ликвидный universe",
+                "score_ge_watch": "Score ≥ 60",
+                "score_ge_min": "Score ≥ 62",
+                "h1_m15_m5_alignment": "H1/M15/M5 alignment",
+                "adx_di_confirmation": "ADX/DI",
+                "vwap_confirmation": "VWAP",
+                "outside_value_area": "Вне Value Area",
+                "midrange_filter": "Вне середины диапазона",
+                "breakout": "Breakout",
+                "retest_confirmation": "Retest + confirmation",
+                "trigger_distance_le_1_5_atr": "Trigger ≤ 1.5 ATR",
+                "structural_sl": "Структурный SL",
+                "minimum_rr_ge_2": "RR ≥ 2.0",
+                "full_quality_gate": "Полный quality gate",
+                "max_2_final_signals": "Финальные сигналы (max 2)",
+            }
+            parts.append("")
+            parts.append("Воронка quality gate:")
+            for row in funnel:
+                stage = row.get("stage")
+                count = row.get("count")
+                parts.append(f"• {labels.get(stage, stage)}: {count}")
+
         blocker_counts = diagnostics.get("blocker_counts") or {}
         if blocker_counts:
             parts.append("")
