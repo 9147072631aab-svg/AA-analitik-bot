@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import threading
 from datetime import datetime, timezone
 
@@ -21,6 +22,51 @@ LAST_SCAN_START = None
 LAST_SCAN_FINISH = None
 LAST_SCAN_RESULT = None
 LAST_SCAN_ERROR = None
+
+# Manual trade-entry workflow.
+# The bot records trades only; it never sends orders to the broker.
+TRADE_DRAFTS = {}
+TRADE_DRAFT_LOCK = threading.Lock()
+
+TRADE_DB_PATH = os.getenv("AA_JOURNAL_DB", "/tmp/aa_analitik_journal.sqlite3")
+
+TRADE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_ts TEXT NOT NULL,
+    chat_id TEXT,
+    market TEXT,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    entry REAL NOT NULL,
+    sl REAL NOT NULL,
+    tp1 REAL,
+    tp2 REAL,
+    tp3 REAL,
+    quantity REAL,
+    risk_rub REAL,
+    rr REAL,
+    strategy TEXT,
+    timeframe TEXT,
+    scanner_score REAL,
+    scanner_trigger REAL,
+    scanner_price REAL,
+    scanner_rr REAL,
+    scanner_regime TEXT,
+    scanner_h1 TEXT,
+    scanner_m15 TEXT,
+    scanner_m5 TEXT,
+    scanner_rsi REAL,
+    scanner_volume_ratio REAL,
+    scanner_trigger_distance_atr REAL,
+    scanner_reason TEXT,
+    notes TEXT,
+    status TEXT DEFAULT 'OPEN',
+    close_price REAL,
+    result_r REAL,
+    closed_ts TEXT
+);
+"""
 
 
 def _now():
@@ -153,32 +199,6 @@ def _extract_scan_text(result):
             parts.append(f"Score >= {min_score:g}: {min_count}")
         if watch_count is not None and watch_score is not None:
             parts.append(f"Score >= {watch_score:g}: {watch_count}")
-
-        funnel = diagnostics.get("funnel") or []
-        if funnel:
-            labels = {
-                "liquidity_universe": "Ликвидный universe",
-                "score_ge_watch": "Score ≥ 60",
-                "score_ge_min": "Score ≥ 62",
-                "h1_m15_m5_alignment": "H1/M15/M5 alignment",
-                "adx_di_confirmation": "ADX/DI",
-                "vwap_confirmation": "VWAP",
-                "outside_value_area": "Вне Value Area",
-                "midrange_filter": "Вне середины диапазона",
-                "breakout": "Breakout",
-                "retest_confirmation": "Retest + confirmation",
-                "trigger_distance_le_1_5_atr": "Trigger ≤ 1.5 ATR",
-                "structural_sl": "Структурный SL",
-                "minimum_rr_ge_2": "RR ≥ 2.0",
-                "full_quality_gate": "Полный quality gate",
-                "max_2_final_signals": "Финальные сигналы (max 2)",
-            }
-            parts.append("")
-            parts.append("Воронка quality gate:")
-            for row in funnel:
-                stage = row.get("stage")
-                count = row.get("count")
-                parts.append(f"• {labels.get(stage, stage)}: {count}")
 
         blocker_counts = diagnostics.get("blocker_counts") or {}
         if blocker_counts:
@@ -363,6 +383,358 @@ def enqueue_scan(chat_id=None):
         return True
 
 
+def _trade_db():
+    con = sqlite3.connect(TRADE_DB_PATH, timeout=30)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.executescript(TRADE_SCHEMA)
+    return con
+
+
+def _trade_num(value):
+    try:
+        return float(str(value).strip().replace(",", "."))
+    except Exception:
+        return None
+
+
+def _latest_scan_observation(symbol, side):
+    con = _trade_db()
+    try:
+        columns = [r[1] for r in con.execute("PRAGMA table_info(observations)")]
+        if not columns:
+            return {}
+
+        row = con.execute(
+            """SELECT * FROM observations
+               WHERE symbol=? AND side=?
+               ORDER BY id DESC LIMIT 1""",
+            (symbol.upper(), side.upper()),
+        ).fetchone()
+
+        return dict(zip(columns, row)) if row else {}
+    finally:
+        con.close()
+
+
+def _trade_menu(chat_id):
+    return _send_markup(
+        chat_id,
+        "📝 Журнал сделок\n\n"
+        "Выбери направление сделки.\n"
+        "После заполнения данные будут записаны в журнал автоматически.\n\n"
+        "⚠️ Бот только фиксирует сделку. Ордера брокеру не отправляются.",
+        {
+            "inline_keyboard": [
+                [{"text": "🟢 Покупка / LONG", "callback_data": "trade:LONG"}],
+                [{"text": "🔴 Продажа / SHORT", "callback_data": "trade:SHORT"}],
+                [{"text": "📋 Последние сделки", "callback_data": "trade:list"}],
+            ]
+        },
+    )
+
+
+def _send_markup(chat_id, text, reply_markup):
+    if not chat_id or not TELEGRAM_BOT_TOKEN:
+        return False
+    try:
+        response = requests.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": str(text),
+                "reply_markup": reply_markup,
+                "disable_web_page_preview": True,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        return True
+    except Exception as exc:
+        print(f"TELEGRAM MARKUP ERROR: {type(exc).__name__}: {exc}", flush=True)
+        return False
+
+
+def _answer_callback(callback_id):
+    if not callback_id or not TELEGRAM_BOT_TOKEN:
+        return False
+    try:
+        response = requests.post(
+            f"{TELEGRAM_API}/answerCallbackQuery",
+            json={"callback_query_id": callback_id},
+            timeout=10,
+        )
+        response.raise_for_status()
+        return True
+    except Exception as exc:
+        print(f"TELEGRAM CALLBACK ERROR: {type(exc).__name__}: {exc}", flush=True)
+        return False
+
+
+def _draft_set(chat_id, **values):
+    with TRADE_DRAFT_LOCK:
+        draft = TRADE_DRAFTS.setdefault(str(chat_id), {})
+        draft.update(values)
+        return dict(draft)
+
+
+def _draft_get(chat_id):
+    with TRADE_DRAFT_LOCK:
+        return dict(TRADE_DRAFTS.get(str(chat_id), {}))
+
+
+def _draft_clear(chat_id):
+    with TRADE_DRAFT_LOCK:
+        TRADE_DRAFTS.pop(str(chat_id), None)
+
+
+def _trade_prompt(step):
+    prompts = {
+        1: "Шаг 1/9 — тикер/инструмент.\nНапример: SBER, GAZP, Si-9.26, BTC-9.26",
+        2: "Шаг 2/9 — фактическая цена входа.",
+        3: "Шаг 3/9 — Stop Loss (SL).",
+        4: "Шаг 4/9 — Take Profit 1 (TP1).",
+        5: "Шаг 5/9 — Take Profit 2 (TP2).\nЕсли не используется — отправь 0.",
+        6: "Шаг 6/9 — Take Profit 3 (TP3).\nЕсли не используется — отправь 0.",
+        7: "Шаг 7/9 — количество/объём позиции.",
+        8: "Шаг 8/9 — риск в ₽.\nЕсли не вводишь — отправь 0.",
+        9: "Шаг 9/9 — комментарий.\nЕсли комментария нет — напиши «нет».",
+    }
+    return prompts.get(step, "")
+
+
+def _create_trade(chat_id, draft):
+    symbol = draft["symbol"].upper()
+    side = draft["side"]
+    entry = draft["entry"]
+    sl = draft["sl"]
+
+    obs = _latest_scan_observation(symbol, side)
+
+    risk_distance = abs(entry - sl)
+    rr = None
+    tp1 = draft.get("tp1")
+    if risk_distance and tp1:
+        reward = tp1 - entry if side == "LONG" else entry - tp1
+        if reward > 0:
+            rr = reward / risk_distance
+
+    con = _trade_db()
+    try:
+        con.execute(
+            """INSERT INTO trades (
+                created_ts, chat_id, market, symbol, side, entry, sl,
+                tp1, tp2, tp3, quantity, risk_rub, rr,
+                strategy, timeframe, scanner_score, scanner_trigger,
+                scanner_price, scanner_rr, scanner_regime, scanner_h1,
+                scanner_m15, scanner_m5, scanner_rsi, scanner_volume_ratio,
+                scanner_trigger_distance_atr, scanner_reason, notes
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                _now().isoformat(),
+                str(chat_id),
+                obs.get("market"),
+                symbol,
+                side,
+                entry,
+                sl,
+                draft.get("tp1"),
+                draft.get("tp2"),
+                draft.get("tp3"),
+                draft.get("quantity"),
+                draft.get("risk_rub"),
+                rr,
+                "MOEX Protocol v1.3",
+                "H1/M15/M5",
+                obs.get("score"),
+                obs.get("trigger"),
+                obs.get("price"),
+                obs.get("rr"),
+                obs.get("regime"),
+                obs.get("h1"),
+                obs.get("m15"),
+                obs.get("m5"),
+                obs.get("rsi"),
+                obs.get("volume_ratio"),
+                obs.get("trigger_distance_atr"),
+                str(obs.get("reason", ""))[:1000],
+                draft.get("notes"),
+            ),
+        )
+        trade_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+        con.commit()
+    finally:
+        con.close()
+
+    return trade_id, obs, rr
+
+
+def _trade_list():
+    con = _trade_db()
+    try:
+        rows = con.execute(
+            """SELECT id,created_ts,symbol,side,entry,sl,tp1,tp2,tp3,
+                      quantity,risk_rub,rr,status,result_r
+               FROM trades ORDER BY id DESC LIMIT 10"""
+        ).fetchall()
+    finally:
+        con.close()
+
+    if not rows:
+        return "Журнал сделок пуст."
+
+    lines = ["📋 Последние сделки"]
+    for row in rows:
+        (
+            trade_id, created_ts, symbol, side, entry, sl, tp1, tp2, tp3,
+            quantity, risk_rub, rr, status, result_r
+        ) = row
+        rr_text = f", RR={rr:.2f}" if rr is not None else ""
+        result_text = f", R={result_r:.2f}" if result_r is not None else ""
+        lines.append(
+            f"#{trade_id} {symbol} {side} | вход {entry} | SL {sl} | "
+            f"TP1 {tp1 or '—'} | объём {quantity or '—'} | "
+            f"{status}{rr_text}{result_text}"
+        )
+    return "\n".join(lines)
+
+
+def _trade_saved_text(trade_id, draft, obs, rr):
+    side_text = "ПОКУПКА / LONG" if draft["side"] == "LONG" else "ПРОДАЖА / SHORT"
+    lines = [
+        "✅ Сделка записана в журнал",
+        f"ID сделки: {trade_id}",
+        f"Инструмент: {draft['symbol'].upper()}",
+        f"Направление: {side_text}",
+        f"Вход: {draft['entry']}",
+        f"SL: {draft['sl']}",
+        f"TP1: {draft.get('tp1') or '—'}",
+        f"TP2: {draft.get('tp2') or '—'}",
+        f"TP3: {draft.get('tp3') or '—'}",
+        f"Количество: {draft.get('quantity') or '—'}",
+        f"Риск ₽: {draft.get('risk_rub') or '—'}",
+        f"Расчётный RR по TP1: {f'{rr:.2f}' if rr is not None else '—'}",
+    ]
+
+    if obs:
+        lines += [
+            "",
+            "🤖 Данные последнего скана перенесены автоматически:",
+            f"Score: {obs.get('score') or '—'}",
+            f"Цена скана: {obs.get('price') or '—'}",
+            f"Trigger: {obs.get('trigger') or '—'}",
+            f"RR скана: {obs.get('rr') or '—'}",
+            f"Regime: {obs.get('regime') or '—'}",
+            f"H1/M15/M5: {obs.get('h1') or '—'} / {obs.get('m15') or '—'} / {obs.get('m5') or '—'}",
+            f"RSI: {obs.get('rsi') or '—'}",
+            f"Volume ratio: {obs.get('volume_ratio') or '—'}",
+            f"Trigger distance ATR: {obs.get('trigger_distance_atr') or '—'}",
+        ]
+
+    lines += [
+        "",
+        "Ордера брокеру НЕ отправлялись.",
+        "Запись сохранена в SQLite-журнал бота.",
+    ]
+    return "\n".join(lines)
+
+
+def _handle_trade_callback(callback):
+    _answer_callback(callback.get("id"))
+    message = callback.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    data = str(callback.get("data") or "")
+
+    if data == "trade:list":
+        send(chat_id, _trade_list())
+        return
+
+    if data in ("trade:LONG", "trade:SHORT"):
+        side = data.split(":", 1)[1]
+        _draft_set(chat_id, side=side, step=1)
+        send(
+            chat_id,
+            ("🟢 Заполнение покупки / LONG\n\n" if side == "LONG"
+             else "🔴 Заполнение продажи / SHORT\n\n")
+            + _trade_prompt(1)
+            + "\n\nДля отмены: /cancel",
+        )
+
+
+def _handle_trade_form(chat_id, text):
+    draft = _draft_get(chat_id)
+    if not draft:
+        return False
+
+    step = int(draft.get("step", 1))
+
+    if text.lower() in ("/cancel", "cancel", "отмена"):
+        _draft_clear(chat_id)
+        send(chat_id, "Заполнение сделки отменено.")
+        return True
+
+    if step == 1:
+        symbol = text.strip().upper().replace(" ", "")
+        if len(symbol) < 2:
+            send(chat_id, "Не удалось распознать инструмент. Повтори тикер.")
+            return True
+        _draft_set(chat_id, symbol=symbol, step=2)
+
+    elif step in (2, 3, 4, 5, 6, 7, 8):
+        value = _trade_num(text)
+        if value is None:
+            send(chat_id, "Нужно число. Например: 285.40")
+            return True
+
+        field = {
+            2: "entry",
+            3: "sl",
+            4: "tp1",
+            5: "tp2",
+            6: "tp3",
+            7: "quantity",
+            8: "risk_rub",
+        }[step]
+        _draft_set(chat_id, **{field: value}, step=step + 1)
+
+    elif step == 9:
+        _draft_set(chat_id, notes=text.strip() or "нет", step=10)
+
+    draft = _draft_get(chat_id)
+
+    if draft.get("step") == 10:
+        if draft.get("entry") is None or draft.get("sl") is None:
+            _draft_clear(chat_id)
+            send(chat_id, "Не удалось записать: отсутствует вход или SL.")
+            return True
+
+        # Validate SL direction before saving.
+        if (
+            draft["side"] == "LONG" and draft["sl"] >= draft["entry"]
+        ) or (
+            draft["side"] == "SHORT" and draft["sl"] <= draft["entry"]
+        ):
+            send(
+                chat_id,
+                "⚠️ SL расположен неправильно для выбранного направления.\n"
+                "Сделка не записана. Начни заново через /trade.",
+            )
+            _draft_clear(chat_id)
+            return True
+
+        try:
+            trade_id, obs, rr = _create_trade(chat_id, draft)
+            _draft_clear(chat_id)
+            send(chat_id, _trade_saved_text(trade_id, draft, obs, rr))
+        except Exception as exc:
+            _draft_clear(chat_id)
+            print(f"TRADE SAVE ERROR: {type(exc).__name__}: {exc}", flush=True)
+            send(chat_id, f"Ошибка записи сделки: {type(exc).__name__}: {exc}")
+        return True
+
+    send(chat_id, _trade_prompt(int(draft["step"])))
+    return True
+
+
 def _help_text():
     return (
         "Мой аналитик\n\n"
@@ -408,26 +780,42 @@ def handle(update):
     if not isinstance(update, dict):
         return
 
-    message = (
-        update.get("message")
-        or update.get("edited_message")
-        or {}
-    )
+    callback = update.get("callback_query")
+    if isinstance(callback, dict):
+        message = callback.get("message") or {}
+        chat_id = (message.get("chat") or {}).get("id")
+        if chat_id is not None:
+            LAST_CHAT_ID = chat_id
+        _handle_trade_callback(callback)
+        return
 
+    message = update.get("message") or update.get("edited_message") or {}
     chat_id = (message.get("chat") or {}).get("id")
 
     if chat_id is not None:
         LAST_CHAT_ID = chat_id
 
     text = (message.get("text") or "").strip()
-
     if not text:
+        return
+
+    # Active trade form gets first priority.
+    if _handle_trade_form(chat_id, text):
         return
 
     command = text.split()[0].lower().split("@", 1)[0]
 
-    if command in ("/start", "/help", "help", "помощь"):
+    if command in ("/cancel", "cancel", "отмена"):
+        _draft_clear(chat_id)
+        send(chat_id, "Активное заполнение сделки отсутствует.")
+        return
+
+    if command in ("/start", "/help", "help", "/помощь", "помощь"):
         send(chat_id, _help_text())
+        return
+
+    if command in ("/trade", "trade", "/сделка", "сделка"):
+        _trade_menu(chat_id)
         return
 
     if command in ("/market", "market", "рынок"):
@@ -455,14 +843,9 @@ def handle(update):
             )
         else:
             send(chat_id, "Сканирование уже выполняется.")
-
         return
 
-    send(
-        chat_id,
-        "Неизвестная команда.\n\n" + _help_text(),
-    )
-
+    send(chat_id, "Неизвестная команда.\n\n" + _help_text())
 
 def bot_info():
     if not TELEGRAM_BOT_TOKEN:
