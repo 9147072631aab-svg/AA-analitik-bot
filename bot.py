@@ -148,7 +148,7 @@ def scan_status_text():
         "Состояние сканера",
         f"Состояние: {'ЗАПУЩЕН' if running else 'НЕ ЗАПУЩЕН'}",
         f"Worker: {'RUNNING' if running else 'OK/IDLE'}",
-        "Очередь: отсутствует (v3.2.5)",
+        "Очередь: отсутствует",
         f"Последний старт: {_fmt_dt(start)}",
         f"Последнее завершение: {_fmt_dt(finish)}",
     ]
