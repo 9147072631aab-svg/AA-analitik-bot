@@ -331,6 +331,7 @@ def save_scan(result):
                     status = x.get("status", "WAIT")
                     score = _n(x.get("score"))
                     watch = 1 if x.get("watch") else 0
+                    pg_watch = bool(watch)
 
                     obs_values = (
                         ts, symbol, market, side, status, score,
@@ -359,10 +360,14 @@ def save_scan(result):
                                     (ts,symbol,market,side,status,score,price,entry,trigger,sl,tp1,tp2,tp3,rr,regime,h1,m15,m5,rsi,volume_ratio,trigger_distance_atr,reason,watch)
                                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                                     ON CONFLICT (ts,symbol,side) DO NOTHING""",
-                                    obs_values,
+                                    obs_values[:-1] + (pg_watch,),
                                 )
                             pg.commit()
                         except Exception as exc:
+                            try:
+                                pg.rollback()
+                            except Exception:
+                                pass
                             print(f"POSTGRES OBSERVATION ERROR: {type(exc).__name__}: {exc}", flush=True)
 
                     if status in ("LONG", "SHORT") and (not previous or old_status != status):
@@ -391,6 +396,10 @@ def save_scan(result):
                                 try:
                                     _pg_upsert_active(pg, signal)
                                 except Exception as exc:
+                                    try:
+                                        pg.rollback()
+                                    except Exception:
+                                        pass
                                     print(f"POSTGRES ACTIVE SIGNAL ERROR: {type(exc).__name__}: {exc}", flush=True)
                             row = con.execute("SELECT * FROM active_signals WHERE signal_id=?", (sid,)).fetchone()
                             if row:
@@ -408,6 +417,10 @@ def save_scan(result):
                             )
                     pg.commit()
                 except Exception as exc:
+                    try:
+                        pg.rollback()
+                    except Exception:
+                        pass
                     print(f"POSTGRES EVENT ERROR: {type(exc).__name__}: {exc}", flush=True)
         finally:
             con.close()
