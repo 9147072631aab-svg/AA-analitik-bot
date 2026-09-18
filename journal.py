@@ -357,7 +357,7 @@ def save_scan(result):
                                 cur.execute(
                                     """INSERT INTO observations
                                     (ts,symbol,market,side,status,score,price,entry,trigger,sl,tp1,tp2,tp3,rr,regime,h1,m15,m5,rsi,volume_ratio,trigger_distance_atr,reason,watch)
-                                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                                     ON CONFLICT (ts,symbol,side) DO NOTHING""",
                                     obs_values,
                                 )
