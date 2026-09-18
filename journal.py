@@ -182,10 +182,8 @@ CREATE INDEX IF NOT EXISTS idx_pg_active_symbol_side ON active_signals(symbol, s
 CREATE INDEX IF NOT EXISTS idx_pg_active_status ON active_signals(lifecycle_status);
 """
 
-
 def now():
     return datetime.now(timezone.utc).isoformat()
-
 
 def _n(v):
     try:
@@ -195,16 +193,13 @@ def _n(v):
     except Exception:
         return None
 
-
 def _key(x):
     return str(x.get("symbol", "")).upper(), str(x.get("side", "")).upper()
-
 
 def _risk(entry, sl):
     if entry is None or sl is None:
         return None
     return abs(float(entry) - float(sl))
-
 
 def _pg_connect():
     if not DATABASE_URL:
@@ -220,24 +215,17 @@ def _pg_connect():
         print(f"POSTGRES JOURNAL ERROR: {type(exc).__name__}: {exc}", flush=True)
         return None
 
-
 def connect():
     con = sqlite3.connect(DB_PATH, timeout=30)
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript(SCHEMA)
     return con
 
-
 def _last(con, symbol, side):
     return con.execute(
         "SELECT * FROM observations WHERE symbol=? AND side=? ORDER BY id DESC LIMIT 1",
         (symbol, side),
     ).fetchone()
-
-
-def _columns(con):
-    return [r[1] for r in con.execute("PRAGMA table_info(observations)")]
-
 
 def _signal_from_item(item, market, ts):
     symbol, side = _key(item)
@@ -275,14 +263,12 @@ def _signal_from_item(item, market, ts):
         "reason": str(item.get("reason", ""))[:2000],
     }
 
-
 def _sqlite_upsert_active(con, signal):
     existing = con.execute(
         "SELECT id, signal_id FROM active_signals WHERE symbol=? AND side=? AND lifecycle_status='ACTIVE' ORDER BY id DESC LIMIT 1",
         (signal["symbol"], signal["side"]),
     ).fetchone()
     if existing:
-        # Keep the original lifecycle and fixed levels. Only refresh the observed price/diagnostics.
         con.execute(
             """UPDATE active_signals SET updated_ts=?, price=?, score=?, regime=?, h1=?, m15=?, m5=?, rsi=?, volume_ratio=?, trigger_distance_atr=?, reason=? WHERE id=?""",
             (signal["updated_ts"], signal["price"], signal["score"], signal["regime"], signal["h1"], signal["m15"], signal["m5"], signal["rsi"], signal["volume_ratio"], signal["trigger_distance_atr"], signal["reason"], existing[0]),
@@ -295,7 +281,6 @@ def _sqlite_upsert_active(con, signal):
         tuple(signal[k] for k in ("signal_id","created_ts","updated_ts","market","symbol","side","entry","trigger","sl","tp1","tp2","tp3","rr","score","price","regime","h1","m15","m5","rsi","volume_ratio","trigger_distance_atr","reason")),
     )
     return signal["signal_id"], True
-
 
 def _pg_upsert_active(con, signal):
     with con.cursor() as cur:
@@ -317,22 +302,14 @@ def _pg_upsert_active(con, signal):
     con.commit()
     return signal["signal_id"], True
 
-
 def _append_active(result, active_items):
     if not active_items:
         return
     result.setdefault("active_signals", [])
     result["active_signals"] = active_items
 
-
 def save_scan(result):
-    """Persist scans and create persistent ACTIVE signal lifecycles.
-
-    Once a LONG/SHORT setup has entry/SL/TP levels and passes the scanner gate,
-    its lifecycle is independent from later scanner status. A later WAIT does not
-    delete or invalidate the active lifecycle; only SL, TP3, or explicit manual
-    close ends it.
-    """
+    """Persist scans and create persistent ACTIVE signal lifecycles."""
     ts = now()
     events = []
     active_items = []
@@ -354,17 +331,58 @@ def save_scan(result):
                     status = x.get("status", "WAIT")
                     score = _n(x.get("score"))
                     watch = 1 if x.get("watch") else 0
+
+                    obs_values = (
+                        ts, symbol, market, side, status, score,
+                        _n(x.get("price")), _n(x.get("entry")),
+                        _n(x.get("trigger")), _n(x.get("sl", x.get("stop"))),
+                        _n(x.get("tp1")), _n(x.get("tp2")), _n(x.get("tp3")),
+                        _n(x.get("rr")), x.get("regime"), x.get("h1"),
+                        x.get("m15"), x.get("m5"), _n(x.get("rsi")),
+                        _n(x.get("volume_ratio")), _n(x.get("trigger_distance_atr")),
+                        str(x.get("reason", ""))[:1000], watch
+                    )
+
                     con.execute(
                         """INSERT OR IGNORE INTO observations
                         (ts,symbol,market,side,status,score,price,entry,trigger,sl,tp1,tp2,tp3,rr,regime,h1,m15,m5,rsi,volume_ratio,trigger_distance_atr,reason,watch)
                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (ts, symbol, market, side, status, score, _n(x.get("price")), _n(x.get("entry")), _n(x.get("trigger")), _n(x.get("sl", x.get("stop"))), _n(x.get("tp1")), _n(x.get("tp2")), _n(x.get("tp3")), _n(x.get("rr")), x.get("regime"), x.get("h1"), x.get("m15"), x.get("m5"), _n(x.get("rsi")), _n(x.get("volume_ratio")), _n(x.get("trigger_distance_atr")), str(x.get("reason", ""))[:1000], watch),
+                        obs_values,
                     )
-                    if previous and old_status != status and status in ("LONG", "SHORT"):
-                        events.append({"type":"ENTRY_READY","symbol":symbol,"side":side,"message":f"{symbol} {side}: ENTRY READY","score":score})
+
+                    # PostgreSQL is the permanent observation journal.
+                    if pg:
+                        try:
+                            with pg.cursor() as cur:
+                                cur.execute(
+                                    """INSERT INTO observations
+                                    (ts,symbol,market,side,status,score,price,entry,trigger,sl,tp1,tp2,tp3,rr,regime,h1,m15,m5,rsi,volume_ratio,trigger_distance_atr,reason,watch)
+                                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                    ON CONFLICT (ts,symbol,side) DO NOTHING""",
+                                    obs_values,
+                                )
+                            pg.commit()
+                        except Exception as exc:
+                            print(f"POSTGRES OBSERVATION ERROR: {type(exc).__name__}: {exc}", flush=True)
+
+                    if status in ("LONG", "SHORT") and (not previous or old_status != status):
+                        events.append({
+                            "type": "SIGNAL_CREATED" if not previous else "ENTRY_READY",
+                            "symbol": symbol,
+                            "side": side,
+                            "message": f"{symbol} {side}: {'SIGNAL CREATED' if not previous else 'ENTRY READY'}",
+                            "score": score,
+                        })
                     elif previous and old_score is not None and score is not None and abs(score-old_score) >= 10:
                         direction = "усилен" if score > old_score else "ослаблен"
-                        events.append({"type":"SCORE_SHIFT","symbol":symbol,"side":side,"message":f"{symbol} {side}: score {old_score:.0f} → {score:.0f} ({direction})","score":score})
+                        events.append({
+                            "type": "SCORE_SHIFT",
+                            "symbol": symbol,
+                            "side": side,
+                            "message": f"{symbol} {side}: score {old_score:.0f} → {score:.0f} ({direction})",
+                            "score": score,
+                        })
+
                     if status in ("LONG", "SHORT"):
                         signal = _signal_from_item(x, market, ts)
                         if signal:
@@ -379,11 +397,15 @@ def save_scan(result):
                                 cols = [d[1] for d in con.execute("PRAGMA table_info(active_signals)")]
                                 active_items.append(dict(zip(cols, row)))
             con.commit()
+
             if pg:
                 try:
                     with pg.cursor() as cur:
                         for ev in events:
-                            cur.execute("INSERT INTO events (ts,symbol,side,event_type,old_status,new_status,new_score,message) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (ts,ev.get("symbol"),ev.get("side"),ev["type"],None,None,ev.get("score"),ev["message"]))
+                            cur.execute(
+                                "INSERT INTO events (ts,symbol,side,event_type,old_status,new_status,new_score,message) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                                (ts, ev.get("symbol"), ev.get("side"), ev["type"], None, None, ev.get("score"), ev["message"])
+                            )
                     pg.commit()
                 except Exception as exc:
                     print(f"POSTGRES EVENT ERROR: {type(exc).__name__}: {exc}", flush=True)
@@ -393,7 +415,6 @@ def save_scan(result):
                 pg.close()
     _append_active(result, active_items)
     return events
-
 
 def _update_active_sqlite(con, row, price, ts):
     aid, signal_id, created_ts, updated_ts, market, symbol, side, entry, trigger, sl, tp1, tp2, tp3, rr, score, old_price, regime, h1, m15, m5, rsi, volume_ratio, tda, reason, lifecycle, tp1_hit, tp2_hit, mfe, mae, closed_ts, close_price, close_reason = row
@@ -433,16 +454,13 @@ def _update_active_sqlite(con, row, price, ts):
         new_status = "TP2"
     elif new_tp1:
         new_status = "TP1"
-    con.execute("""UPDATE active_signals SET updated_ts=?, price=?, tp1_hit=?, tp2_hit=?, max_favorable_r=?, max_adverse_r=?, lifecycle_status=?, closed_ts=?, close_price=?, close_reason=? WHERE id=?""", (ts,price,new_tp1,new_tp2,new_mfe,new_mae,new_status,ts if close_reason else None,price if close_reason else None,close_reason,aid))
+    con.execute(
+        """UPDATE active_signals SET updated_ts=?, price=?, tp1_hit=?, tp2_hit=?, max_favorable_r=?, max_adverse_r=?, lifecycle_status=?, closed_ts=?, close_price=?, close_reason=? WHERE id=?""",
+        (ts, price, new_tp1, new_tp2, new_mfe, new_mae, new_status, ts if close_reason else None, price if close_reason else None, close_reason, aid)
+    )
     return {"id":aid,"signal_id":signal_id,"symbol":symbol,"side":side,"status":new_status,"closed":bool(close_reason),"close_reason":close_reason,"price":price,"entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"tp3":tp3,"mfe":new_mfe,"mae":new_mae}
 
-
 def update_virtual_outcomes(result):
-    """Track persistent active signals by latest observed scan price.
-
-    Scanner status changes do not close a signal. SL or TP3 closes it; TP1/TP2 are
-    milestones. Price-only snapshot tracking cannot resolve intrabar ordering.
-    """
     ts = now()
     prices = {}
     for key in ("stocks", "futures"):
@@ -468,7 +486,10 @@ def update_virtual_outcomes(result):
                             pg_row = cur.fetchone()
                             if pg_row:
                                 local = con.execute("SELECT tp1_hit,tp2_hit,max_favorable_r,max_adverse_r,lifecycle_status,closed_ts,close_price,close_reason,price,updated_ts FROM active_signals WHERE id=?", (row[0],)).fetchone()
-                                cur.execute("""UPDATE active_signals SET updated_ts=%s, price=%s, tp1_hit=%s, tp2_hit=%s, max_favorable_r=%s, max_adverse_r=%s, lifecycle_status=%s, closed_ts=%s, close_price=%s, close_reason=%s WHERE id=%s""", (local[9],local[8],local[0],local[1],local[2],local[3],local[4],local[5],local[6],local[7],pg_row[0]))
+                                cur.execute(
+                                    """UPDATE active_signals SET updated_ts=%s, price=%s, tp1_hit=%s, tp2_hit=%s, max_favorable_r=%s, max_adverse_r=%s, lifecycle_status=%s, closed_ts=%s, close_price=%s, close_reason=%s WHERE id=%s""",
+                                    (local[9],local[8],local[0],local[1],local[2],local[3],local[4],local[5],local[6],local[7],pg_row[0])
+                                )
                     except Exception as exc:
                         print(f"POSTGRES ACTIVE UPDATE ERROR: {type(exc).__name__}: {exc}", flush=True)
             con.commit()
@@ -479,7 +500,6 @@ def update_virtual_outcomes(result):
             if pg:
                 pg.close()
     return closed
-
 
 def get_active_signals(include_closed=False):
     with LOCK:
@@ -494,24 +514,28 @@ def get_active_signals(include_closed=False):
         finally:
             con.close()
 
-
 def close_active_signal(signal_id, price=None, reason="MANUAL_CLOSE"):
     ts = now()
     with LOCK:
         con = connect()
         pg = _pg_connect()
         try:
-            con.execute("UPDATE active_signals SET lifecycle_status=?, updated_ts=?, closed_ts=?, close_price=?, close_reason=? WHERE signal_id=? AND lifecycle_status IN ('ACTIVE','TP1','TP2')", (reason,ts,ts,_n(price),reason,signal_id))
+            con.execute(
+                "UPDATE active_signals SET lifecycle_status=?, updated_ts=?, closed_ts=?, close_price=?, close_reason=? WHERE signal_id=? AND lifecycle_status IN ('ACTIVE','TP1','TP2')",
+                (reason, ts, ts, _n(price), reason, signal_id)
+            )
             con.commit()
             if pg:
                 with pg.cursor() as cur:
-                    cur.execute("UPDATE active_signals SET lifecycle_status=%s, updated_ts=%s, closed_ts=%s, close_price=%s, close_reason=%s WHERE signal_id=%s AND lifecycle_status IN ('ACTIVE','TP1','TP2')", (reason,ts,ts,_n(price),reason,signal_id))
+                    cur.execute(
+                        "UPDATE active_signals SET lifecycle_status=%s, updated_ts=%s, closed_ts=%s, close_price=%s, close_reason=%s WHERE signal_id=%s AND lifecycle_status IN ('ACTIVE','TP1','TP2')",
+                        (reason, ts, ts, _n(price), reason, signal_id)
+                    )
                 pg.commit()
         finally:
             con.close()
             if pg:
                 pg.close()
-
 
 def daily_stats():
     with LOCK:
