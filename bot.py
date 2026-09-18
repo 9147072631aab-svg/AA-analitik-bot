@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 
@@ -80,6 +80,10 @@ def _fmt_dt(value):
     if not value:
         return "—"
     try:
+        if isinstance(value, str):
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     except Exception:
         return str(value)
@@ -314,10 +318,6 @@ def _scan_thread_target(chat_id=None):
 
         summary = _result_summary(result)
 
-        # IMPORTANT:
-        # Set IDLE and completion time BEFORE sending the Telegram result.
-        # This makes /scanstatus consistent immediately after the result
-        # appears in Telegram.
         with STATE_LOCK:
             LAST_SCAN_RESULT = summary
             SCAN_RUNNING = False
@@ -780,7 +780,6 @@ def _trade_list():
     return "\n".join(lines)
 
 
-
 def _trade_saved_text(trade_id, draft, obs, rr):
     side_text = "ПОКУПКА / LONG" if draft["side"] == "LONG" else "ПРОДАЖА / SHORT"
     lines = [
@@ -868,8 +867,6 @@ def _handle_trade_callback(callback):
         )
 
 
-
-
 def _handle_trade_form(chat_id, text):
     draft = _draft_get(chat_id)
     if not draft:
@@ -880,7 +877,6 @@ def _handle_trade_form(chat_id, text):
         send(chat_id, "Заполнение сделки отменено.")
         return True
 
-    # Closing an existing position is intentionally a separate short form.
     if draft.get("close_mode"):
         step = int(draft.get("step", 1))
 
@@ -910,7 +906,6 @@ def _handle_trade_form(chat_id, text):
                 send(chat_id, f"Ошибка закрытия позиции: {type(exc).__name__}: {exc}")
             return True
 
-    # Opening a new position.
     step = int(draft.get("step", 1))
 
     if step == 1:
@@ -975,7 +970,6 @@ def _handle_trade_form(chat_id, text):
     return True
 
 
-
 def _help_text():
     return (
         "🤖 Мой аналитик\n\n"
@@ -1008,25 +1002,351 @@ def _status_text():
     )
 
 
+# ---------------------------------------------------------------------------
+# Unified report: autonomous AI signals + real trades
+# ---------------------------------------------------------------------------
+
+def _ai_signal_rows():
+    """
+    Reads autonomous signal lifecycles from permanent Supabase/PostgreSQL.
+    Falls back to the local SQLite journal if PostgreSQL is unavailable.
+
+    active_signals is used instead of observations so repeated scans of the
+    same signal are not counted as separate AI signals.
+    """
+    wanted = [
+        "id", "created_ts", "updated_ts", "symbol", "market", "side",
+        "lifecycle_status", "entry", "trigger", "sl", "tp1", "tp2", "tp3",
+        "rr", "score", "price", "regime", "h1", "m15", "m5", "rsi",
+        "volume_ratio", "reason", "tp1_hit_ts", "tp2_hit_ts",
+        "tp3_hit_ts", "sl_hit_ts", "closed_ts", "close_price",
+        "close_reason", "max_favorable_r", "max_adverse_r",
+        "tp1_hit", "tp2_hit", "tp3_hit", "source_observation_ts",
+        "signal_id",
+    ]
+
+    rows = []
+    source = "SQLite"
+
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if database_url:
+        try:
+            import psycopg
+
+            conn = psycopg.connect(database_url, connect_timeout=10)
+            try:
+                query = """
+                    SELECT
+                        id, created_ts, updated_ts, symbol, market, side,
+                        lifecycle_status, entry, trigger, sl, tp1, tp2, tp3,
+                        rr, score, price, regime, h1, m15, m5, rsi,
+                        volume_ratio, reason, tp1_hit_ts, tp2_hit_ts,
+                        tp3_hit_ts, sl_hit_ts, closed_ts, close_price,
+                        close_reason, max_favorable_r, max_adverse_r,
+                        tp1_hit, tp2_hit, tp3_hit, source_observation_ts,
+                        signal_id
+                    FROM active_signals
+                    ORDER BY created_ts DESC
+                """
+                rows = conn.execute(query).fetchall()
+            finally:
+                conn.close()
+
+            source = "Supabase"
+        except Exception as exc:
+            print(
+                f"AI REPORT PG ERROR: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+    if not rows:
+        try:
+            con = _trade_db()
+            try:
+                existing = {
+                    row[1] for row in con.execute("PRAGMA table_info(active_signals)")
+                }
+
+                if existing:
+                    selected = [column for column in wanted if column in existing]
+                    if "id" in selected and "symbol" in selected:
+                        rows = con.execute(
+                            "SELECT " + ",".join(selected) +
+                            " FROM active_signals ORDER BY created_ts DESC"
+                        ).fetchall()
+
+                        normalized = []
+                        for row in rows:
+                            data = dict(zip(selected, row))
+                            normalized.append(tuple(data.get(c) for c in wanted))
+                        rows = normalized
+            finally:
+                con.close()
+        except Exception as exc:
+            print(
+                f"AI REPORT SQLITE ERROR: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+    return rows, source
+
+
+def _ai_signal_result(row):
+    """
+    Returns:
+      open  -> signal is still being tracked
+      win   -> terminal TP3
+      loss  -> terminal SL
+      closed -> manually/administratively closed without TP3/SL
+    """
+    status = str(row[6] or "").upper()
+    side = str(row[5] or "").upper()
+    entry = _trade_num(row[7])
+    sl = _trade_num(row[9])
+    close_price = _trade_num(row[28])
+
+    if status in ("ACTIVE", "TP1", "TP2", "WATCH"):
+        return "open", None
+
+    if status == "TP3":
+        if (
+            entry is not None
+            and sl is not None
+            and close_price is not None
+            and abs(entry - sl) > 0
+        ):
+            if side == "LONG":
+                return "win", (close_price - entry) / abs(entry - sl)
+            return "win", (entry - close_price) / abs(entry - sl)
+        return "win", None
+
+    if status == "SL":
+        return "loss", -1.0
+
+    # A manual/administrative close is terminal, but is not a win/loss.
+    if row[27] or row[29] or status:
+        return "closed", None
+
+    return "open", None
+
+
+def _fmt_msk(value):
+    if not value:
+        return "—"
+
+    try:
+        if isinstance(value, str):
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+
+        msk = timezone(timedelta(hours=3), "MSK")
+        return value.astimezone(msk).strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return str(value)
+
+
+def _fmt_num(value, digits=3):
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):.{digits}f}"
+    except Exception:
+        return str(value)
+
+
 def _journal_report():
+    # ----- Autonomous AI signals -----
+    ai_rows, ai_source = _ai_signal_rows()
+
+    ai_total = len(ai_rows)
+    ai_open = 0
+    ai_closed = 0
+    ai_wins = 0
+    ai_losses = 0
+    ai_no_result = 0
+    ai_longs = 0
+    ai_shorts = 0
+    ai_rs = []
+
+    tp1_hits = 0
+    tp2_hits = 0
+    tp3_hits = 0
+    sl_hits = 0
+
+    for row in ai_rows:
+        side = str(row[5] or "").upper()
+
+        if side == "LONG":
+            ai_longs += 1
+        elif side == "SHORT":
+            ai_shorts += 1
+
+        state, result_r = _ai_signal_result(row)
+
+        if state == "open":
+            ai_open += 1
+        elif state in ("win", "loss", "closed"):
+            ai_closed += 1
+
+            if state == "win":
+                ai_wins += 1
+            elif state == "loss":
+                ai_losses += 1
+            else:
+                ai_no_result += 1
+
+        if result_r is not None:
+            ai_rs.append(float(result_r))
+
+        # Infer terminal TP3/SL from lifecycle as a compatibility fallback.
+        if bool(row[33]) or row[23]:
+            tp1_hits += 1
+        if bool(row[34]) or row[24]:
+            tp2_hits += 1
+        if bool(row[35]) or str(row[6] or "").upper() == "TP3":
+            tp3_hits += 1
+        if bool(row[32]) or str(row[6] or "").upper() == "SL":
+            sl_hits += 1
+
+    ai_avg = sum(ai_rs) / len(ai_rs) if ai_rs else None
+    ai_sum = sum(ai_rs) if ai_rs else None
+
+    # ----- Real trades -----
     con = _trade_db()
     try:
         total = con.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-        opened = con.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'").fetchone()[0]
-        closed = con.execute("SELECT COUNT(*) FROM trades WHERE status='CLOSED'").fetchone()[0]
-        wins = con.execute("SELECT COUNT(*) FROM trades WHERE status='CLOSED' AND result_r > 0").fetchone()[0]
-        losses = con.execute("SELECT COUNT(*) FROM trades WHERE status='CLOSED' AND result_r < 0").fetchone()[0]
-        breakeven = con.execute("SELECT COUNT(*) FROM trades WHERE status='CLOSED' AND result_r = 0").fetchone()[0]
-        avg_r = con.execute("SELECT AVG(result_r) FROM trades WHERE status='CLOSED' AND result_r IS NOT NULL").fetchone()[0]
-        sum_r = con.execute("SELECT SUM(result_r) FROM trades WHERE status='CLOSED' AND result_r IS NOT NULL").fetchone()[0]
-        longs = con.execute("SELECT COUNT(*) FROM trades WHERE side='LONG'").fetchone()[0]
-        shorts = con.execute("SELECT COUNT(*) FROM trades WHERE side='SHORT'").fetchone()[0]
-        latest = con.execute("SELECT id,symbol,side,entry,close_price,result_r,status FROM trades ORDER BY id DESC LIMIT 5").fetchall()
+        opened = con.execute(
+            "SELECT COUNT(*) FROM trades WHERE status='OPEN'"
+        ).fetchone()[0]
+        closed = con.execute(
+            "SELECT COUNT(*) FROM trades WHERE status='CLOSED'"
+        ).fetchone()[0]
+        wins = con.execute(
+            "SELECT COUNT(*) FROM trades "
+            "WHERE status='CLOSED' AND result_r > 0"
+        ).fetchone()[0]
+        losses = con.execute(
+            "SELECT COUNT(*) FROM trades "
+            "WHERE status='CLOSED' AND result_r < 0"
+        ).fetchone()[0]
+        breakeven = con.execute(
+            "SELECT COUNT(*) FROM trades "
+            "WHERE status='CLOSED' AND result_r = 0"
+        ).fetchone()[0]
+        avg_r = con.execute(
+            "SELECT AVG(result_r) FROM trades "
+            "WHERE status='CLOSED' AND result_r IS NOT NULL"
+        ).fetchone()[0]
+        sum_r = con.execute(
+            "SELECT SUM(result_r) FROM trades "
+            "WHERE status='CLOSED' AND result_r IS NOT NULL"
+        ).fetchone()[0]
+        longs = con.execute(
+            "SELECT COUNT(*) FROM trades WHERE side='LONG'"
+        ).fetchone()[0]
+        shorts = con.execute(
+            "SELECT COUNT(*) FROM trades WHERE side='SHORT'"
+        ).fetchone()[0]
+        latest = con.execute(
+            """SELECT id,created_ts,symbol,side,entry,sl,tp1,tp2,tp3,
+                      status,close_price,result_r,closed_ts
+               FROM trades ORDER BY id DESC LIMIT 5"""
+        ).fetchall()
     finally:
         con.close()
 
     lines = [
-        "📊 Отчёт журнала сделок",
+        "📊 ОТЧЁТ ТОРГОВОГО ИИ",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "🤖 АВТОНОМНЫЕ СИГНАЛЫ ИИ",
+        "Сигналы, найденные системой самостоятельно",
+        f"Источник журнала: {ai_source}",
+        "",
+        f"Всего сигналов: {ai_total}",
+        f"Открытых: {ai_open}",
+        f"Закрытых: {ai_closed}",
+        "",
+        f"LONG: {ai_longs}",
+        f"SHORT: {ai_shorts}",
+        "",
+        f"Побед: {ai_wins}",
+        f"Убытков: {ai_losses}",
+        f"Без результата: {ai_no_result}",
+        (
+            f"Win rate: {(ai_wins / (ai_wins + ai_losses) * 100):.1f}%"
+            if (ai_wins + ai_losses)
+            else "Win rate: —"
+        ),
+        (
+            f"Средний результат: {ai_avg:+.2f} R"
+            if ai_avg is not None
+            else "Средний результат: —"
+        ),
+        (
+            f"Суммарный результат: {ai_sum:+.2f} R"
+            if ai_sum is not None
+            else "Суммарный результат: —"
+        ),
+        "",
+        f"TP1: {tp1_hits}",
+        f"TP2: {tp2_hits}",
+        f"TP3: {tp3_hits}",
+        f"SL: {sl_hits}",
+        "",
+        "Последние AI-сигналы:",
+    ]
+
+    if not ai_rows:
+        lines.append("— автономных сигналов пока нет")
+    else:
+        for row in ai_rows[:5]:
+            symbol = row[3] or "?"
+            side = str(row[5] or "?").upper()
+            state, result_r = _ai_signal_result(row)
+
+            if state == "open":
+                status_text = "🟡 В РАБОТЕ"
+                result_text = "результат пока не зафиксирован"
+            elif state == "win":
+                status_text = "🟢 TP3"
+                result_text = (
+                    f"результат: {result_r:+.2f} R"
+                    if result_r is not None
+                    else "результат: TP3"
+                )
+            elif state == "loss":
+                status_text = "🔴 SL"
+                result_text = "результат: -1.00 R"
+            else:
+                status_text = "⚪ ЗАКРЫТ"
+                result_text = "результат не классифицирован"
+
+            lines += [
+                "",
+                f"{symbol} {side}",
+                f"Время: {_fmt_msk(row[1])} MSK",
+                f"Score: {_fmt_num(row[14], 1)}",
+                f"Вход: {_fmt_num(row[7])}",
+                f"Trigger: {_fmt_num(row[8])}",
+                f"SL: {_fmt_num(row[9])}",
+                f"TP1: {_fmt_num(row[10])}",
+                f"TP2: {_fmt_num(row[11])}",
+                f"TP3: {_fmt_num(row[12])}",
+                f"RR: {_fmt_num(row[13], 2)}",
+                f"Статус: {status_text}",
+                f"Результат: {result_text}",
+            ]
+
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "💼 РЕАЛЬНЫЕ СДЕЛКИ",
+        "Позиции, которые пользователь действительно открыл",
+        "",
         f"Всего сделок: {total}",
         f"Открытых: {opened}",
         f"Закрытых: {closed}",
@@ -1034,19 +1354,76 @@ def _journal_report():
         f"Убыточных: {losses}",
         f"Без результата: {breakeven}",
         f"LONG: {longs} | SHORT: {shorts}",
-        f"Win rate: {(wins / closed * 100):.1f}%" if closed else "Win rate: —",
-        f"Средний результат: {avg_r:+.2f} R" if avg_r is not None else "Средний результат: —",
-        f"Суммарный результат: {sum_r:+.2f} R" if sum_r is not None else "Суммарный результат: —",
+        (
+            f"Win rate: {(wins / (wins + losses) * 100):.1f}%"
+            if (wins + losses)
+            else "Win rate: —"
+        ),
+        (
+            f"Средний результат: {avg_r:+.2f} R"
+            if avg_r is not None
+            else "Средний результат: —"
+        ),
+        (
+            f"Суммарный результат: {sum_r:+.2f} R"
+            if sum_r is not None
+            else "Суммарный результат: —"
+        ),
         "",
-        "Последние сделки:",
+        "Последние реальные сделки:",
     ]
+
     if not latest:
-        lines.append("— журнал пуст")
+        lines.append("— реальных сделок пока нет")
     else:
-        for tid, symbol, side, entry, close_price, result_r, status in latest:
+        for (
+            tid, created_ts, symbol, side, entry, sl, tp1, tp2, tp3,
+            status, close_price, result_r, closed_ts
+        ) in latest:
             result = f" | {result_r:+.2f} R" if result_r is not None else ""
-            close = f" → {close_price}" if close_price is not None else ""
-            lines.append(f"#{tid} {symbol} {side}: {entry}{close} | {status}{result}")
+            close = f" → закрытие {close_price}" if close_price is not None else ""
+            lines.append(
+                f"#{tid} {symbol} {side} | вход {entry} | SL {sl}"
+                f"{close} | {status}{result}"
+            )
+
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "📊 ОБЩАЯ СТАТИСТИКА",
+        f"Реальные сделки: {total}",
+        f"Автономные сигналы ИИ: {ai_total}",
+        (
+            f"Реальный Win rate: {(wins / (wins + losses) * 100):.1f}%"
+            if (wins + losses)
+            else "Реальный Win rate: —"
+        ),
+        (
+            f"AI Win rate: {(ai_wins / (ai_wins + ai_losses) * 100):.1f}%"
+            if (ai_wins + ai_losses)
+            else "AI Win rate: —"
+        ),
+        (
+            f"Реальный результат: {sum_r:+.2f} R"
+            if sum_r is not None
+            else "Реальный результат: —"
+        ),
+        (
+            f"AI результат: {ai_sum:+.2f} R"
+            if ai_sum is not None
+            else "AI результат: —"
+        ),
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "🧠 ПРОТОКОЛ",
+        "AI-сигналы учитываются отдельно от реальных сделок.",
+        "Они участвуют в AI Win Rate и статистике R.",
+        f"Закрытых AI-сигналов с классифицируемым исходом: {ai_wins + ai_losses}.",
+        "По накопленной статистике можно отдельно анализировать и корректировать торговый протокол.",
+    ]
+
     return "\n".join(lines)
 
 
@@ -1075,8 +1452,11 @@ def _trade_reset(chat_id):
         con.commit()
     finally:
         con.close()
-    send(chat_id, f"🧹 Журнал сделок очищен. Удалено записей: {count}.\nНаблюдения сканера сохранены.")
-
+    send(
+        chat_id,
+        f"🧹 Журнал сделок очищен. Удалено записей: {count}.\n"
+        "Наблюдения сканера сохранены.",
+    )
 
 
 def handle(update):
@@ -1104,7 +1484,6 @@ def handle(update):
     if not text:
         return
 
-    # Active trade form gets first priority.
     if _handle_trade_form(chat_id, text):
         return
 
@@ -1159,6 +1538,7 @@ def handle(update):
         return
 
     send(chat_id, "Неизвестная команда.\n\n" + _help_text())
+
 
 def bot_info():
     if not TELEGRAM_BOT_TOKEN:
